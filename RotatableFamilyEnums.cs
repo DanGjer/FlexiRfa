@@ -38,6 +38,9 @@ public enum RotatableFamilyPreset
 
     [Description("Light Fixture (Rectangular)")]
     RectangularLightFixture,
+
+    [Description("Data Socket (Double RJ45)")]
+    DataSocketDouble,
 }
 
 public enum ExtrusionProfileShape

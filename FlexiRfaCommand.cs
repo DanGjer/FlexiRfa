@@ -29,6 +29,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         if (string.IsNullOrWhiteSpace(args.NewFamilyName))
             return Result.Text.Failed("New family name is required.");
 
+        if (FamilyNameExists(activeDocument, args.NewFamilyName))
+            return Result.Text.Failed($"A family named '{args.NewFamilyName}' already exists in this document. Choose a different name or use 'Edit Existing Family' instead.");
+
         var application = activeDocument.Application;
         var workingDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         Directory.CreateDirectory(workingDirectory);
@@ -54,6 +57,8 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             var error = ReplaceOrientationGeometry(familyDocument, args, out var geometryHost);
             if (error is not null)
                 return Result.Text.Failed(error);
+
+            PruneConnectors(familyDocument, args.Preset);
 
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
@@ -107,6 +112,8 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             if (error is not null)
                 return Result.Text.Failed(error);
 
+            PruneConnectors(familyDocument, args.Preset);
+
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
             return Result.Text.Succeeded($"Updated the extrusion on family '{familyName}'. Geometry was written into '{geometryHost}'.");
@@ -123,6 +130,42 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
     // Text family parameter carried by the template; records how the family was generated.
     private const string OriginParameterName = "Origin";
+
+    // Comments values (set on each connector in the template) required to keep it for a given preset;
+    // presets not listed here are left untouched. Extend this as more presets get their own connectors.
+    private static readonly IReadOnlyDictionary<RotatableFamilyPreset, string[]> RequiredConnectorTags = new Dictionary<RotatableFamilyPreset, string[]>
+    {
+        [RotatableFamilyPreset.DataSocketDouble] = ["Data-1", "Data-2"],
+    };
+
+    // Deletes template-provided connectors that aren't needed for the given preset, identified by their
+    // Comments value (e.g. "Data-1"). Presets without an entry in RequiredConnectorTags are left alone.
+    private static void PruneConnectors(Document familyDocument, RotatableFamilyPreset preset)
+    {
+        if (!RequiredConnectorTags.TryGetValue(preset, out var requiredTags))
+            return;
+
+        var connectorsToDelete = new FilteredElementCollector(familyDocument)
+            .OfClass(typeof(ConnectorElement))
+            .Cast<ConnectorElement>()
+            .Where(c => !requiredTags.Contains(c.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.AsString(), StringComparer.OrdinalIgnoreCase))
+            .Select(c => c.Id)
+            .ToList();
+
+        if (connectorsToDelete.Count == 0)
+            return;
+
+        using var transaction = new Transaction(familyDocument, "Remove unused connectors");
+        transaction.Start();
+        familyDocument.Delete(connectorsToDelete);
+        transaction.Commit();
+    }
+
+    private static bool FamilyNameExists(Document activeDocument, string familyName) =>
+        new FilteredElementCollector(activeDocument)
+            .OfClass(typeof(Family))
+            .Cast<Family>()
+            .Any(f => f.Name.Equals(familyName, StringComparison.OrdinalIgnoreCase));
 
     private static string BuildOrigin(FlexiRfaArgs args) => args.Preset == RotatableFamilyPreset.Custom
         ? $"Preset - Custom {args.ProfileShape}"
@@ -245,6 +288,8 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             BuildElectricalSocket(geometryDocument, args.Preset);
         else if (args.Preset == RotatableFamilyPreset.RectangularLightFixture)
             BuildRectangularLightFixture(geometryDocument, args.LightFixtureLength, args.LightFixtureWidth);
+        else if (args.Preset == RotatableFamilyPreset.DataSocketDouble)
+            BuildDataSocketDouble(geometryDocument);
         else
             BuildPresetGeometry(geometryDocument, ResolveDimensions(args));
 
@@ -372,6 +417,70 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         var diffuserSketchPlane = SketchPlane.Create(nestedDocument, GetHorizontalPlaneAtOrigin(nestedDocument, housingDepth));
         nestedDocument.FamilyCreate.NewExtrusion(true, BuildRoundedRectangleProfile(width - diffuserInsetMm, length - diffuserInsetMm, 6), diffuserSketchPlane, diffuserDepth);
+    }
+
+    // Wall plate with a raised, stepped cover frame across the top and two blind, tapered
+    // RJ45 pockets in the lower half (wider flared entry over a narrower inner pocket). Built
+    // entirely from stacked solid layers with holes appended into their profiles, the same
+    // proven technique as BuildElectricalSocket, rather than void forms (which failed to cut).
+    private static void BuildDataSocketDouble(Document nestedDocument)
+    {
+        const double plateWidthMm = 85;
+        const double plateHeightMm = 85;
+
+        const double backDepthMm = 17;
+        const double innerPortDepthMm = 4;
+        const double outerPortDepthMm = 5;
+
+        const double hoodHeightMm = 28;
+        const double hoodStepDepthMm = 2;
+        const double lipHeightMm = 10;
+        const double lipInsetMm = 4;
+        const double lipStepDepthMm = 2;
+
+        const double portWidthMm = 16;
+        const double portHeightMm = 21;
+        const double portSpacingMm = 6;
+        const double portFlareMarginMm = 4;
+        const double portVerticalOffsetMm = -10;
+
+        var backDepth = UnitUtils.ConvertToInternalUnits(backDepthMm, UnitTypeId.Millimeters);
+        var innerPortDepth = UnitUtils.ConvertToInternalUnits(innerPortDepthMm, UnitTypeId.Millimeters);
+        var outerPortDepth = UnitUtils.ConvertToInternalUnits(outerPortDepthMm, UnitTypeId.Millimeters);
+        var baseDepth = backDepth + innerPortDepth + outerPortDepth;
+        var hoodStepDepth = UnitUtils.ConvertToInternalUnits(hoodStepDepthMm, UnitTypeId.Millimeters);
+        var lipStepDepth = UnitUtils.ConvertToInternalUnits(lipStepDepthMm, UnitTypeId.Millimeters);
+
+        var horizontalOffset = UnitUtils.ConvertToInternalUnits((portWidthMm + portSpacingMm) / 2, UnitTypeId.Millimeters);
+        var verticalOffset = UnitUtils.ConvertToInternalUnits(portVerticalOffsetMm, UnitTypeId.Millimeters);
+
+        // Plain backing, no holes, so the pockets above never reach through to the back.
+        var backSketchPlane = SketchPlane.Create(nestedDocument, GetHorizontalPlaneAtOrigin(nestedDocument));
+        nestedDocument.FamilyCreate.NewExtrusion(true, BuildRoundedRectangleProfile(plateWidthMm, plateHeightMm, 8), backSketchPlane, backDepth);
+
+        // Inner pocket layer: narrower square openings.
+        var innerProfile = BuildRoundedRectangleProfile(plateWidthMm, plateHeightMm, 8);
+        innerProfile.Append(BuildRectangleLoop(portWidthMm, portHeightMm, verticalOffset, -horizontalOffset));
+        innerProfile.Append(BuildRectangleLoop(portWidthMm, portHeightMm, verticalOffset, horizontalOffset));
+        var innerSketchPlane = SketchPlane.Create(nestedDocument, GetHorizontalPlaneAtOrigin(nestedDocument, backDepth));
+        nestedDocument.FamilyCreate.NewExtrusion(true, innerProfile, innerSketchPlane, innerPortDepth);
+
+        // Outer pocket layer: wider, flared openings reaching the front face.
+        var outerProfile = BuildRoundedRectangleProfile(plateWidthMm, plateHeightMm, 8);
+        outerProfile.Append(BuildRectangleLoop(portWidthMm + portFlareMarginMm, portHeightMm + portFlareMarginMm, verticalOffset, -horizontalOffset));
+        outerProfile.Append(BuildRectangleLoop(portWidthMm + portFlareMarginMm, portHeightMm + portFlareMarginMm, verticalOffset, horizontalOffset));
+        var outerSketchPlane = SketchPlane.Create(nestedDocument, GetHorizontalPlaneAtOrigin(nestedDocument, backDepth + innerPortDepth));
+        nestedDocument.FamilyCreate.NewExtrusion(true, outerProfile, outerSketchPlane, outerPortDepth);
+
+        // Raised hood across the top, stepped up in two stages like a hinged cable-entry flap.
+        var hoodVerticalOffset = UnitUtils.ConvertToInternalUnits(plateHeightMm / 2 - hoodHeightMm / 2, UnitTypeId.Millimeters);
+        var hoodSketchPlane = SketchPlane.Create(nestedDocument, GetHorizontalPlaneAtOrigin(nestedDocument, baseDepth));
+        nestedDocument.FamilyCreate.NewExtrusion(true, BuildRoundedRectangleProfile(plateWidthMm, hoodHeightMm, 8, hoodVerticalOffset), hoodSketchPlane, hoodStepDepth);
+
+        var lipVerticalOffset = UnitUtils.ConvertToInternalUnits(plateHeightMm / 2 - lipHeightMm / 2, UnitTypeId.Millimeters);
+        var lipSketchPlane = SketchPlane.Create(nestedDocument, GetHorizontalPlaneAtOrigin(nestedDocument, baseDepth + hoodStepDepth));
+        // Radius must be well below half lipHeightMm (5mm) to avoid zero-length segments.
+        nestedDocument.FamilyCreate.NewExtrusion(true, BuildRoundedRectangleProfile(plateWidthMm - lipInsetMm * 2, lipHeightMm, 3, lipVerticalOffset), lipSketchPlane, lipStepDepth);
     }
 
     // Outlet centres in internal units: single sits at the origin, double stacks vertically, quadruple forms a 2x2 grid.
@@ -526,6 +635,20 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         var loop = new CurveArray();
         loop.Append(Arc.Create(centre, radius, 0, Math.PI, XYZ.BasisX, XYZ.BasisY));
         loop.Append(Arc.Create(centre, radius, Math.PI, 2 * Math.PI, XYZ.BasisX, XYZ.BasisY));
+        return loop;
+    }
+
+    private static CurveArray BuildRectangleLoop(double widthMm, double heightMm, double verticalOffset = 0, double horizontalOffset = 0)
+    {
+        var halfWidth = UnitUtils.ConvertToInternalUnits(widthMm, UnitTypeId.Millimeters) / 2;
+        var halfHeight = UnitUtils.ConvertToInternalUnits(heightMm, UnitTypeId.Millimeters) / 2;
+        var centre = new XYZ(horizontalOffset, verticalOffset, 0);
+
+        var loop = new CurveArray();
+        loop.Append(Line.CreateBound(centre + new XYZ(-halfWidth, -halfHeight, 0), centre + new XYZ(halfWidth, -halfHeight, 0)));
+        loop.Append(Line.CreateBound(centre + new XYZ(halfWidth, -halfHeight, 0), centre + new XYZ(halfWidth, halfHeight, 0)));
+        loop.Append(Line.CreateBound(centre + new XYZ(halfWidth, halfHeight, 0), centre + new XYZ(-halfWidth, halfHeight, 0)));
+        loop.Append(Line.CreateBound(centre + new XYZ(-halfWidth, halfHeight, 0), centre + new XYZ(-halfWidth, -halfHeight, 0)));
         return loop;
     }
 }

@@ -1,299 +1,68 @@
-# FlexiRfa Developer Guide
+# FlexiRfa
 
-## Introduction
+FlexiRfa is a Revit extension for creating and editing **rotatable families** — families that can be freely rotated in 3D via a nested "3D Orientation Family" — without having to model the geometry by hand in the Family Editor every time.
 
-The FlexiRfa is a framework for developing extensions that automate tasks within Autodesk Revit. This guide provides a comprehensive overview of how to develop, customize, and deploy Revit extensions using this template.
+It ships as a set of presets for common MEP/electrical fixtures (downlights, smoke detectors, electrical sockets, rectangular light fixtures) as well as a fully custom box/cylinder extrusion mode.
 
-## Core Components
+## What it does
 
-A Revit extension consists of three key components:
+- **Create New Family**: copies one of the bundled rotatable family templates, sets the family category, and generates the fixture geometry inside the nested "3D Orientation Family", then loads the result into the active Revit document.
+- **Edit Existing Family**: select an already-placed instance created by FlexiRfa, adjust the settings, and the tool regenerates its geometry in place (family name, placement, and rotation parameters are preserved).
 
-1. **Args Class**: Defines input parameters and UI controls
-2. **Command Class**: Implements the extension logic (IRevitExtension interface)
-3. **Result Class**: Standardizes the output format
+Every family generated this way is stamped with a hidden `Origin` text parameter recording which preset/settings created it, so re-editing later can verify the settings still match before touching the geometry.
 
-## Implementation Pattern
+## Requirements
 
-### 1. Define the Args Class
+- Autodesk Revit (built against **2026** by default — see `MainRevitVersion` in [FlexiRfa.csproj](FlexiRfa.csproj) if targeting a different version).
+- .NET 8 SDK.
+- The [flexRevit](https://www.flexrevit.com/) extension host, which loads and runs `IRevitExtension` add-ins like this one.
 
-The Args class defines the input parameters and UI controls for your extension:
+## Building and installing
 
-```csharp
-public class FlexiRfaArgs
-{
-    [Description("Parameter Name")]
-    [ControlData(ToolTip = "Enter parameter description")]
-    public string ParameterName { get; set; } = "Default value";
-    
-    // Add ValueCopy functionality when needed
-    [ValueCopyCollector(typeof(ValueCopyRevitCollector))]
-    public ValueCopy ValueCopy { get; set; }
-}
+```powershell
+dotnet build FlexiRfa.csproj -c Debug
 ```
 
-### 2. Implement the Command Class
+This produces the extension package under `bin/Debug/net8.0-windows/publish`. Point your flexRevit extension folder at that output (or use `dotnet publish`) so it appears in Revit's flexRevit panel.
 
-The Command class contains the core logic for your extension:
+## Using the tool
 
-```csharp
-public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
-{
-    public IExtensionResult Run(IRevitExtensionContext context, FlexiRfaArgs args, 
-        CancellationToken cancellationToken)
-    {
-        var document = context.UIApplication.ActiveUIDocument?.Document;
-        if (document is null)
-            return Result.Text.Failed("Revit has no active model open");
-            
-        // Basic implementation pattern:
-        // 1. Access Revit document and selected elements
-        // 2. Start a transaction
-        // 3. Perform model modifications
-        // 4. Commit the transaction
-        // 5. Return a success/failure result
-        
-        using var transaction = new Transaction(document, "RevitExtension");
-        transaction.Start();
-        
-        // Extension-specific logic here
-        
-        transaction.Commit();
-        return Result.Text.Succeeded("Operation completed successfully");
-    }
-}
-```
+Run **FlexiRfa** from the flexRevit ribbon in Revit. The dialog fields change depending on **Mode** and **Preset**:
 
-### 3. Return a Result
+### Mode
 
-All extensions should return an `IExtensionResult` to indicate success or failure:
+| Mode | Description |
+|---|---|
+| **Create New Family** | Requires a **Family template** (`.rft`/`.rfa`) and a **New family name**. A copy of the template is created, renamed, and loaded into the current document. |
+| **Edit Existing Family** | Select a rotatable family instance in the model first. FlexiRfa checks its stored `Origin` value against the current settings and refuses to edit if they don't match (change the settings to match, or create a new family instead). |
 
-```csharp
-// Success result
-return Result.Text.Succeeded("Operation completed successfully");
+### Common fields
 
-// Failure result
-return Result.Text.Failed("Error message explaining what went wrong");
-```
+- **Family category** — optional; sets the Revit category of the generated family (autocompleted from the categories in the active model).
+- **Preset** — chooses the fixture shape/dimensions. Selecting **Custom** exposes manual profile controls.
 
-## Working with Revit Elements
+### Presets
 
-### Accessing the Document
+| Preset | Fields | Result |
+|---|---|---|
+| **Custom** | Profile shape (Box/Cylinder), Width/Height or Diameter, Depth | A single extrusion (optionally on top of a wider/shallower flange if configured). |
+| **Downlight** | Downlight diameter | Recessed cylindrical body with a ceiling trim ring. |
+| **Smoke Detector** | Smoke detector diameter | Surface-mounted sensor chamber with a ceiling plate 25 mm wider than the chamber. |
+| **Electrical Socket (Single/Double/Quadruple)** | *(fixed dimensions)* | Wall plate with 1, 2 (stacked), or 4 (2×2 grid) recessed 40 mm outlets, each with pin holes. |
+| **Light Fixture (Rectangular)** | Fixture length, Fixture width | Surface-mounted batten luminaire: shallow housing with an inset diffuser. |
 
-```csharp
-var document = context.UIApplication.ActiveUIDocument?.Document;
-if (document is null)
-    return Result.Text.Failed("Revit has no active model open");
-```
+## Bundled templates
 
-### Getting Selected Elements
+The repository includes ready-to-use rotatable family templates:
 
-```csharp
-var selectedIds = context.UIApplication.ActiveUIDocument.Selection.GetElementIds();
-if (!selectedIds.Any())
-    return Result.Text.Failed("No elements selected");
-```
+- [Roterbar Familie Template.rfa](Roterbar%20Familie%20Template.rfa) and versioned variants (`.0003`, `.0004`, `.0005`)
+- [magiFamilyGeom Geometry.rfa](magiFamilyGeom%20Geometry.rfa)
 
-### Element Collection
-
-```csharp
-var collector = new FilteredElementCollector(document);
-var walls = collector.OfCategory(BuiltInCategory.OST_Walls).WhereElementIsNotElementType();
-```
-
-### Transactions
-
-Always use transactions for model modifications:
-
-```csharp
-using var transaction = new Transaction(document, "Description");
-transaction.Start();
-// Modify elements
-transaction.Commit();
-```
-
-### Parameter Access
-
-```csharp
-var parameter = element.LookupParameter("ParameterName");
-var value = parameter.AsString(); // or AsDouble(), AsInteger(), etc.
-parameter.Set(newValue);
-```
-
-## UI Controls and Attributes
-
-### Basic Control Attributes
-
-- `[Description("Label")]`: Sets field label
-- `[ControlData(ToolTip = "Help text")]`: Adds tooltip
-- `[Required]`: Makes input mandatory
-- `[DefaultValue("Default")]`: Sets default value
-- `[ControlSettings("PropertyName", "Value")]`: Configure control properties
-
-### Control Types
-
-- `[ControlType(ControlType.ComboBox)]`: Dropdown selection
-- `[ControlType(ControlType.ListBox)]`: Multi-selection list
-- `[ControlType(ControlType.Option)]`: Single-option selection
-- `[ControlType(ControlType.RadioButton)]`: Radio button group
-- `[ControlType(ControlType.Browse)]`: File browser dialog
-- `[ControlType(ControlType.Save)]`: File save dialog
-
-### Text Input Customization
-
-- `[ControlSettings("IsMultiline", "True")]`: Enable multi-line text input
-- `[ControlSettings("MinLines", "5")]`: Set minimum lines for text area
-- `[ControlSettings("MaxLines", "10")]`: Set maximum lines for text area
-- `[ControlSettings("Foreground", "Red")]`: Change text color
-
-### Auto-Fill Sources
-
-- `[CustomRevitAutoFill(typeof(CustomCollectorClass))]`: Custom Revit data collector
-- `[RevitAutoFill(RevitAutoFillSource.Phases)]`: Use built-in Revit phases
-- `[RevitAutoFill(RevitAutoFillSource.Categories)]`: Use Revit categories
-- `[RevitAutoFill(RevitAutoFillSource.FamilyAndType)]`: Use family types
-
-## ValueCopy Functionality
-
-ValueCopy enables parameter and property value copying between Revit elements:
-
-### Setup in Args
-
-```csharp
-[ValueCopyCollector(typeof(ValueCopyRevitCollector))]
-public ValueCopy ValueCopy { get; set; }
-```
-
-### Implementing ValueCopy Collector
-
-```csharp
-// Simplified ValueCopy collector implementation
-public class ValueCopyRevitCollector : IValueCopyRevitCollector<RevitExtensionArgs>
-{
-    // Define source elements for value copy
-    public ValueCopyRevitSources GetSources(IValueCopyRevitContext context, RevitExtensionArgs args)
-    {
-        // Filter elements that can be sources for parameter values
-        var filter = new FilteredElementCollector(context.Document)
-            .WhereElementIsElementType();
-        return new ValueCopyRevitSources(filter);
-    }
-
-    // Define target elements for value copy
-    public ValueCopyRevitTargets GetTargets(IValueCopyRevitContext context, RevitExtensionArgs args)
-    {
-        // Similar filtering for target elements
-        return new ValueCopyRevitTargets(GetElementsFilter(context));
-    }
-}
-```
-
-### Using ValueCopy in Command
-
-```csharp
-// Get the handler for the ValueCopy functionality
-var valueCopyHandler = context.GetHandler(args.ValueCopy);
-
-// Three common usage patterns:
-valueCopyHandler.Handle(sourceElement, targetElement);  // Copy between elements
-valueCopyHandler.Handle(targetElement);                 // Copy within same element
-valueCopyHandler.Handle(sourceElement, targetElements); // Copy to multiple targets
-```
-
-## Custom AutoFill Collectors
-
-Implement intelligent parameter suggestions with a custom collector:
-
-```csharp
-// Custom collector for populating UI dropdowns with parameter names
-public class ParameterAutoFillCollector : IRevitAutoFillCollector<ExtensionArgs>
-{
-    public Dictionary<string, string> Get(UIApplication uiApplication, ExtensionArgs args)
-    {
-        var result = new Dictionary<string, string>();
-        
-        try {
-            // Collect relevant parameter names from the Revit model
-            var document = uiApplication.ActiveUIDocument.Document;
-            var parameterNames = GetRelevantParameterNames(document);
-            
-            // Add each parameter to the result dictionary
-            foreach (var name in parameterNames)
-                result.Add(name, name);
-        }
-        catch (Exception e) {
-            result.Add(string.Empty, $"Error: {e.Message}");
-        }
-        
-        return result;
-    }
-}
-```
-
-## Best Practices
-
-1. **Check for null references**: Always verify document and elements exist before operating on them
-2. **Use transactions**: Wrap all model modifications in transactions
-3. **Error handling**: Provide clear error messages when operations fail
-4. **Filter elements efficiently**: Use appropriate filters to improve performance
-5. **Document your code**: Add comments to explain complex operations
-6. **Validate input parameters**: Ensure required parameters are provided and valid
-
-## Example: Parameter Copy Extension
-
-Here's a simplified example of how to create a parameter copy extension:
-
-```csharp
-// Args class - defines input UI
-public class ParameterCopyArgs
-{
-    [Description("Source Parameter")]
-    [CustomRevitAutoFill(typeof(ParameterAutoFillCollector))]
-    public string SourceParameter { get; set; }
-    
-    [Description("Target Parameter")]
-    [CustomRevitAutoFill(typeof(ParameterAutoFillCollector))]
-    public string TargetParameter { get; set; }
-}
-
-// Command class - key implementation points
-public class ParameterCopyCommand : IRevitExtension<ParameterCopyArgs>
-{
-    public IExtensionResult Run(IRevitExtensionContext context, ParameterCopyArgs args, 
-        CancellationToken cancellationToken)
-    {
-        // Get document and selected elements
-        var document = context.UIApplication.ActiveUIDocument?.Document;
-        var selectedIds = context.UIApplication.ActiveUIDocument.Selection.GetElementIds();
-        
-        // Execute with transaction
-        using var transaction = new Transaction(document, "Parameter Copy");
-        transaction.Start();
-        
-        // Core logic: copy parameter values between elements
-        foreach (var id in selectedIds)
-        {
-            var element = document.GetElement(id);
-            var sourceParam = element.LookupParameter(args.SourceParameter);
-            var targetParam = element.LookupParameter(args.TargetParameter);
-            
-            // Copy value based on parameter storage type
-            if (sourceParam != null && targetParam != null)
-            {
-                // Copy parameter value (simplified)
-                CopyParameterValue(sourceParam, targetParam);
-            }
-        }
-        
-        transaction.Commit();
-        return Result.Text.Succeeded("Parameters copied successfully");
-    }
-}
-```
+Pick one of these as the **Family template** when creating a new family, or supply your own template as long as it contains a nested family named **"3D Orientation Family"** and an `Origin` text family parameter.
 
 ## Troubleshooting
 
-- **Nothing happens**: Check for errors in exception handling
-- **Transaction issues**: Ensure Start() and Commit() are properly paired
-- **Element not found**: Verify element selection filters
-- **Parameter problems**: Confirm parameter existence and type match
-- **Compilation errors**: Check for missing references or namespaces
+- **"Select a rotatable family instance in the model first."** — the current selection contains no `FamilyInstance` created by FlexiRfa.
+- **"...was not generated by this tool and cannot be edited."** — the selected family has no `Origin` parameter; only families created via FlexiRfa's "Create New Family" mode can be edited this way.
+- **"...was generated as 'X', but the current settings describe 'Y'."** — change the dialog's Preset/settings to match the family's original settings, or use "Create New Family" instead.
+- **"Could not find the nested '3D Orientation Family'..."** — the chosen template doesn't follow the expected structure; use one of the bundled templates.

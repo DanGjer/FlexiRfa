@@ -18,7 +18,7 @@ public class FlexiRfaArgs
 
     [FilePickerField(Label = "Family template", ToolTip = "The .rft template used to create the new family", FileExtensions = ["rft", "rfa"], Visibility = $"{nameof(Mode)} == 'CreateNew'")]
     [Required(ErrorMessage = "A family template is required.")]
-    public string TemplatePath { get; set; } = string.Empty;
+    public string TemplatePath { get; set; } = @"O:\A005000\A008170\EL\Utvikling\Roterbare familier\Roterbar Familie Template.rfa";
 
     [TextField(Label = "New family name", Visibility = $"{nameof(Mode)} == 'CreateNew'")]
     [Required(ErrorMessage = "New family name is required.")]
