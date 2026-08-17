@@ -58,7 +58,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             if (error is not null)
                 return Result.Text.Failed(error);
 
-            PruneConnectors(familyDocument, args.Preset);
+            var connectorError = RebuildPresetConnectors(familyDocument, args.Preset);
+            if (connectorError is not null)
+                return Result.Text.Failed(connectorError);
 
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
@@ -112,7 +114,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             if (error is not null)
                 return Result.Text.Failed(error);
 
-            PruneConnectors(familyDocument, args.Preset);
+            var connectorError = RebuildPresetConnectors(familyDocument, args.Preset);
+            if (connectorError is not null)
+                return Result.Text.Failed(connectorError);
 
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
@@ -131,34 +135,139 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
     // Text family parameter carried by the template; records how the family was generated.
     private const string OriginParameterName = "Origin";
 
-    // Comments values (set on each connector in the template) required to keep it for a given preset;
-    // presets not listed here are left untouched. Extend this as more presets get their own connectors.
-    private static readonly IReadOnlyDictionary<RotatableFamilyPreset, string[]> RequiredConnectorTags = new Dictionary<RotatableFamilyPreset, string[]>
+    private readonly record struct ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType SystemType, double HorizontalOffsetMm, double VerticalOffsetMm);
+
+    // Electrical connectors are created on demand from preset policy; templates no longer need pre-placed connectors.
+    private static readonly IReadOnlyDictionary<RotatableFamilyPreset, ElectricalConnectorSpec[]> PresetConnectorSpecs = new Dictionary<RotatableFamilyPreset, ElectricalConnectorSpec[]>
     {
-        [RotatableFamilyPreset.DataSocketDouble] = ["Data-1", "Data-2"],
+        [RotatableFamilyPreset.DataSocketDouble] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.Data, -11, -10),
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.Data, 11, -10),
+        ],
+        [RotatableFamilyPreset.ElectricalSocket] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.PowerCircuit, 0, 0),
+        ],
+        [RotatableFamilyPreset.ElectricalSocketSingle] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.PowerCircuit, 0, 0),
+        ],
+        [RotatableFamilyPreset.ElectricalSocketQuadruple] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.PowerCircuit, 0, 0),
+        ],
+        [RotatableFamilyPreset.Downlight] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.PowerCircuit, 0, 0),
+        ],
+        [RotatableFamilyPreset.SmokeDetector] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.FireAlarm, 0, 0),
+        ],
+        [RotatableFamilyPreset.RectangularLightFixture] =
+        [
+            new ElectricalConnectorSpec(Autodesk.Revit.DB.Electrical.ElectricalSystemType.PowerCircuit, 0, 0),
+        ],
     };
 
-    // Deletes template-provided connectors that aren't needed for the given preset, identified by their
-    // Comments value (e.g. "Data-1"). Presets without an entry in RequiredConnectorTags are left alone.
-    private static void PruneConnectors(Document familyDocument, RotatableFamilyPreset preset)
+    private static string? RebuildPresetConnectors(Document familyDocument, RotatableFamilyPreset preset)
     {
-        if (!RequiredConnectorTags.TryGetValue(preset, out var requiredTags))
-            return;
+        using var transaction = new Transaction(familyDocument, "Rebuild preset connectors");
+        transaction.Start();
 
-        var connectorsToDelete = new FilteredElementCollector(familyDocument)
+        var existingConnectorIds = new FilteredElementCollector(familyDocument)
             .OfClass(typeof(ConnectorElement))
             .Cast<ConnectorElement>()
-            .Where(c => !requiredTags.Contains(c.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.AsString(), StringComparer.OrdinalIgnoreCase))
             .Select(c => c.Id)
             .ToList();
+        if (existingConnectorIds.Count > 0)
+            familyDocument.Delete(existingConnectorIds);
 
-        if (connectorsToDelete.Count == 0)
-            return;
+        if (!PresetConnectorSpecs.TryGetValue(preset, out var connectorSpecs) || connectorSpecs.Length == 0)
+        {
+            transaction.Commit();
+            return null;
+        }
 
-        using var transaction = new Transaction(familyDocument, "Remove unused connectors");
-        transaction.Start();
-        familyDocument.Delete(connectorsToDelete);
+        var hostFace = GetConnectorHostFace(familyDocument);
+        if (hostFace is null)
+        {
+            transaction.RollBack();
+            return "Could not find a host face for creating electrical connectors. Ensure the generated family has at least one planar form face.";
+        }
+
+        foreach (var spec in connectorSpecs)
+        {
+            var connector = ConnectorElement.CreateElectricalConnector(familyDocument, spec.SystemType, hostFace.Reference);
+            var target = new XYZ(
+                UnitUtils.ConvertToInternalUnits(spec.HorizontalOffsetMm, UnitTypeId.Millimeters),
+                UnitUtils.ConvertToInternalUnits(spec.VerticalOffsetMm, UnitTypeId.Millimeters),
+                hostFace.Origin.Z);
+            var move = target - connector.Origin;
+            if (move.GetLength() > 1e-9)
+                ElementTransformUtils.MoveElement(familyDocument, connector.Id, move);
+        }
+
         transaction.Commit();
+        return null;
+    }
+
+    private static PlanarFace? GetConnectorHostFace(Document familyDocument)
+    {
+        var options = new Options { ComputeReferences = true };
+        PlanarFace? bestFace = null;
+        var bestScore = double.NegativeInfinity;
+
+        foreach (var element in new FilteredElementCollector(familyDocument).WhereElementIsNotElementType())
+        {
+            var geometry = element.get_Geometry(options);
+            if (geometry is null)
+                continue;
+
+            foreach (var solid in EnumerateSolids(geometry))
+            {
+                if (solid.Faces.IsEmpty)
+                    continue;
+
+                foreach (Face face in solid.Faces)
+                {
+                    if (face is not PlanarFace planar || planar.Reference is null)
+                        continue;
+
+                    // Prefer a +Z facing planar face at the largest Z elevation.
+                    var score = planar.FaceNormal.DotProduct(XYZ.BasisZ) * 10_000 + planar.Origin.Z;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestFace = planar;
+                    }
+                }
+            }
+        }
+
+        return bestFace;
+    }
+
+    private static IEnumerable<Solid> EnumerateSolids(GeometryElement geometry)
+    {
+        foreach (var obj in geometry)
+        {
+            switch (obj)
+            {
+                case Solid solid when solid.Volume > 0:
+                    yield return solid;
+                    break;
+                case GeometryInstance instance:
+                    var instanceGeometry = instance.GetInstanceGeometry();
+                    if (instanceGeometry is null)
+                        break;
+
+                    foreach (var nestedSolid in EnumerateSolids(instanceGeometry))
+                        yield return nestedSolid;
+                    break;
+            }
+        }
     }
 
     private static bool FamilyNameExists(Document activeDocument, string familyName) =>
