@@ -1,15 +1,14 @@
 # FlexiRfa
 
-FlexiRfa is a Revit extension for creating and editing **rotatable families** — families that can be freely rotated in 3D via a nested "3D Orientation Family" — without having to model the geometry by hand in the Family Editor every time.
+FlexiRfa is a Revit extension for creating **rotatable families** — families that can be freely rotated in 3D via a nested "3D Orientation Family" — without having to model the geometry by hand in the Family Editor every time.
 
-It ships as a set of presets for common MEP/electrical fixtures (downlights, smoke detectors, electrical sockets, rectangular light fixtures) as well as a fully custom box/cylinder extrusion mode.
+It ships with presets for common electrical fixtures (downlights, smoke detectors, electrical sockets, data outlets, rectangular light fixtures) plus a fully custom box/cylinder extrusion mode, and wires up the appropriate electrical connectors automatically.
 
 ## What it does
 
-- **Create New Family**: copies one of the bundled rotatable family templates, sets the family category, and generates the fixture geometry inside the nested "3D Orientation Family", then loads the result into the active Revit document.
-- **Edit Existing Family**: select an already-placed instance created by FlexiRfa, adjust the settings, and the tool regenerates its geometry in place (family name, placement, and rotation parameters are preserved).
+Copies one of the bundled rotatable family templates, sets the family category, generates the fixture geometry inside the nested "3D Orientation Family", creates the electrical connectors for the chosen preset, and loads the finished family into the active Revit document.
 
-Every family generated this way is stamped with a hidden `Origin` text parameter recording which preset/settings created it, so re-editing later can verify the settings still match before touching the geometry.
+The tool is **create-only** by design. If a generated family isn't right, delete it from the model and generate a new one with adjusted settings.
 
 ## Requirements
 
@@ -27,29 +26,41 @@ This produces the extension package under `bin/Debug/net8.0-windows/publish`. Po
 
 ## Using the tool
 
-Run **FlexiRfa** from the flexRevit ribbon in Revit. The dialog fields change depending on **Mode** and **Preset**:
-
-### Mode
-
-| Mode | Description |
-|---|---|
-| **Create New Family** | Requires a **Family template** (`.rft`/`.rfa`) and a **New family name**. A copy of the template is created, renamed, and loaded into the current document. |
-| **Edit Existing Family** | Select a rotatable family instance in the model first. FlexiRfa checks its stored `Origin` value against the current settings and refuses to edit if they don't match (change the settings to match, or create a new family instead). |
+Run **FlexiRfa** from the flexRevit ribbon in Revit.
 
 ### Common fields
 
-- **Family category** — optional; sets the Revit category of the generated family (autocompleted from the categories in the active model).
-- **Preset** — chooses the fixture shape/dimensions. Selecting **Custom** exposes manual profile controls.
+- **Family template** — the `.rft`/`.rfa` template to copy. Defaults to the shared network template.
+- **New family name** — required. Generation fails if a family with this name already exists in the document, rather than silently overwriting it.
+- **Family category** — the Revit category to assign, limited to the categories electrical engineers use (Electrical Equipment/Fixtures, Lighting Fixtures/Devices, Data, Communication, Fire Alarm, Security, Nurse Call and Telephone Devices).
+- **Preset** — chooses the fixture shape and dimensions. Selecting **Custom** exposes the manual profile and connector controls.
 
 ### Presets
 
-| Preset | Fields | Result |
-|---|---|---|
-| **Custom** | Profile shape (Box/Cylinder), Width/Height or Diameter, Depth | A single extrusion (optionally on top of a wider/shallower flange if configured). |
-| **Downlight** | Downlight diameter | Recessed cylindrical body with a ceiling trim ring. |
-| **Smoke Detector** | Smoke detector diameter | Surface-mounted sensor chamber with a ceiling plate 25 mm wider than the chamber. |
-| **Electrical Socket (Single/Double/Quadruple)** | *(fixed dimensions)* | Wall plate with 1, 2 (stacked), or 4 (2×2 grid) recessed 40 mm outlets, each with pin holes. |
-| **Light Fixture (Rectangular)** | Fixture length, Fixture width | Surface-mounted batten luminaire: shallow housing with an inset diffuser. |
+| Preset | Fields | Result | Connectors |
+|---|---|---|---|
+| **Custom** | Profile shape (Box/Cylinder), Width/Height or Diameter, Depth (all default to 200 mm) | A single extrusion. | Chosen via checkboxes |
+| **Downlight** | Downlight diameter | Recessed cylindrical body with a ceiling trim ring. | 1 × Power |
+| **Smoke Detector** | Smoke detector diameter | Surface-mounted sensor chamber with a ceiling plate 25 mm wider than the chamber. | 1 × Fire Alarm |
+| **Electrical Socket (Single/Double/Quadruple)** | *(fixed dimensions)* | Wall plate with 1, 2 (stacked), or 4 (2×2 grid) recessed 40 mm outlets, each with pin holes. | 1 × Power |
+| **Data Socket (Double RJ45)** | *(fixed dimensions)* | 85 × 85 mm wall plate with a stepped cover frame and two recessed, tapered RJ45 pockets. | 2 × Data |
+| **Data Outlet (Single RJ45)** | *(fixed dimensions)* | As above with a single centred RJ45 pocket. | 1 × Data |
+| **Light Fixture (Rectangular)** | Fixture length, Fixture width | Surface-mounted batten luminaire: shallow housing with an inset diffuser. | 1 × Power |
+
+### Connectors
+
+Electrical connectors are generated from scratch each time — the template does not need any pre-placed connectors.
+
+For the **Custom** preset, tick the connectors you need. Each type is hosted on its own face of the extrusion so connectors never overlap and always land in a predictable spot:
+
+| Connector | Face |
+|---|---|
+| Power | Left |
+| Data | Right |
+| Communication | Top |
+| Fire alarm | Bottom |
+| Security | Back |
+| Controls | Front |
 
 ## Bundled templates
 
@@ -58,11 +69,10 @@ The repository includes ready-to-use rotatable family templates:
 - [Roterbar Familie Template.rfa](Roterbar%20Familie%20Template.rfa) and versioned variants (`.0003`, `.0004`, `.0005`)
 - [magiFamilyGeom Geometry.rfa](magiFamilyGeom%20Geometry.rfa)
 
-Pick one of these as the **Family template** when creating a new family, or supply your own template as long as it contains a nested family named **"3D Orientation Family"** and an `Origin` text family parameter.
+Pick one of these as the **Family template**, or supply your own as long as it contains a nested family named **"3D Orientation Family"**.
 
 ## Troubleshooting
 
-- **"Select a rotatable family instance in the model first."** — the current selection contains no `FamilyInstance` created by FlexiRfa.
-- **"...was not generated by this tool and cannot be edited."** — the selected family has no `Origin` parameter; only families created via FlexiRfa's "Create New Family" mode can be edited this way.
-- **"...was generated as 'X', but the current settings describe 'Y'."** — change the dialog's Preset/settings to match the family's original settings, or use "Create New Family" instead.
+- **"A family named 'X' already exists in this document."** — pick a different name, or delete the existing family first.
 - **"Could not find the nested '3D Orientation Family'..."** — the chosen template doesn't follow the expected structure; use one of the bundled templates.
+- **"Could not find the extrusion geometry to host electrical connectors on."** — geometry generation produced no solid to attach connectors to; check the preset's dimension values.

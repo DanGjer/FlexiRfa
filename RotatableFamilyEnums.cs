@@ -2,19 +2,10 @@
 // RotatableFamilyEnums.cs
 //
 // Enumerations used by FlexiRfaArgs to configure the rotatable family
-// creation/editing workflow.
+// creation workflow.
 //-----------------------------------------------------------------------------
 
 namespace FlexiRfa;
-
-public enum RotatableFamilyMode
-{
-    [Description("Create New Family")]
-    CreateNew,
-
-    [Description("Edit Existing Family")]
-    EditExisting,
-}
 
 public enum RotatableFamilyPreset
 {
@@ -41,6 +32,9 @@ public enum RotatableFamilyPreset
 
     [Description("Data Socket (Double RJ45)")]
     DataSocketDouble,
+
+    [Description("Data Outlet (Single RJ45)")]
+    DataOutletSingle,
 }
 
 public enum ExtrusionProfileShape
