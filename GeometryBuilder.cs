@@ -93,7 +93,6 @@ internal static class GeometryBuilder
         var backClosureDepth = UnitUtils.ConvertToInternalUnits(backClosureMm, UnitTypeId.Millimeters);
         var backCutDepth = UnitUtils.ConvertToInternalUnits(backCutDepthMm, UnitTypeId.Millimeters);
         var faceDepth = UnitUtils.ConvertToInternalUnits(faceDepthMm, UnitTypeId.Millimeters);
-        var panelOrPadDepth = UnitUtils.ConvertToInternalUnits(panelOrPadDepthMm, UnitTypeId.Millimeters);
         var pinSpacing = UnitUtils.ConvertToInternalUnits(9.5, UnitTypeId.Millimeters);
         var outletCentres = GetOutletCentres(preset, plateHeightMm);
 
@@ -129,13 +128,23 @@ internal static class GeometryBuilder
 
         var topSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, backClosureDepth + backCutDepth + faceDepth));
 
-        // Each outlet gets its own small raised pad with a hole cut through it, so the outlet itself reads as an
-        // individual recessed pocket rather than sharing one continuous frame with its neighbours.
+        // Each outlet gets a small, contained bevelled frame: a slightly wider base step under the
+        // original flat pad size, giving a subtle inclined edge without dwarfing the plate itself.
+        const double padBevelMarginMm = 4;
+        const double padBaseDepthMm = 10;
+        const double padCapDepthMm = 10;
+        var padBaseDepth = UnitUtils.ConvertToInternalUnits(padBaseDepthMm, UnitTypeId.Millimeters);
+        var padCapDepth = UnitUtils.ConvertToInternalUnits(padCapDepthMm, UnitTypeId.Millimeters);
+
         foreach (var (verticalOffset, horizontalOffset) in outletCentres)
         {
-            var padProfile = ProfileFactory.BuildRoundedRectangleProfile(padSizeMm, padSizeMm, 6, verticalOffset, horizontalOffset);
-            padProfile.Append(ProfileFactory.BuildCircleLoop(outletDiameterMm, verticalOffset, horizontalOffset));
-            nestedDocument.FamilyCreate.NewExtrusion(true, padProfile, topSketchPlane, panelOrPadDepth);
+            var baseProfile = ProfileFactory.BuildRoundedRectangleProfile(padSizeMm + padBevelMarginMm * 2, padSizeMm + padBevelMarginMm * 2, 6, verticalOffset, horizontalOffset);
+            nestedDocument.FamilyCreate.NewExtrusion(true, baseProfile, topSketchPlane, padBaseDepth);
+
+            var capSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, backClosureDepth + backCutDepth + faceDepth + padBaseDepth));
+            var capProfile = ProfileFactory.BuildRoundedRectangleProfile(padSizeMm, padSizeMm, 6, verticalOffset, horizontalOffset);
+            capProfile.Append(ProfileFactory.BuildCircleLoop(outletDiameterMm, verticalOffset, horizontalOffset));
+            nestedDocument.FamilyCreate.NewExtrusion(true, capProfile, capSketchPlane, padCapDepth);
         }
     }
 

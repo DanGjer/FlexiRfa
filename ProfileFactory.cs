@@ -45,13 +45,22 @@ internal static class ProfileFactory
 
     internal static CurveArrArray BuildRoundedRectangleProfile(double widthMm, double depthMm, double cornerRadiusMm, double verticalOffset = 0, double horizontalOffset = 0)
     {
+        var profile = new CurveArrArray();
+        profile.Append(BuildRoundedRectangleLoop(widthMm, depthMm, cornerRadiusMm, verticalOffset, horizontalOffset));
+        return profile;
+    }
+
+    // Bare loop variant, needed wherever a single CurveArray is required instead of a CurveArrArray
+    // (e.g. Blend profiles, which don't support multiple/holed loops).
+    internal static CurveArray BuildRoundedRectangleLoop(double widthMm, double depthMm, double cornerRadiusMm, double verticalOffset = 0, double horizontalOffset = 0)
+    {
         var halfWidth = UnitUtils.ConvertToInternalUnits(widthMm, UnitTypeId.Millimeters) / 2;
         var halfDepth = UnitUtils.ConvertToInternalUnits(depthMm, UnitTypeId.Millimeters) / 2;
         var r = Math.Min(UnitUtils.ConvertToInternalUnits(cornerRadiusMm, UnitTypeId.Millimeters), Math.Min(halfWidth, halfDepth) - 1e-6);
         var centre = new XYZ(horizontalOffset, verticalOffset, 0);
 
         if (r <= 0)
-            return BuildRectangleProfile(widthMm, depthMm);
+            return BuildRectangleLoop(widthMm, depthMm, verticalOffset, horizontalOffset);
 
         var loop = new CurveArray();
 
@@ -67,9 +76,7 @@ internal static class ProfileFactory
         loop.Append(Line.CreateBound(centre + new XYZ(-halfWidth, halfDepth - r, 0), centre + new XYZ(-halfWidth, -halfDepth + r, 0)));
         loop.Append(CornerArc(centre + new XYZ(-halfWidth + r, -halfDepth + r, 0), centre + new XYZ(-halfWidth, -halfDepth + r, 0), centre + new XYZ(-halfWidth + r, -halfDepth, 0)));
 
-        var profile = new CurveArrArray();
-        profile.Append(loop);
-        return profile;
+        return loop;
 
         Arc CornerArc(XYZ arcCentre, XYZ start, XYZ end)
         {
