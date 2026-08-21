@@ -21,8 +21,12 @@ internal static class GeometryBuilder
         if (existingForms.Count > 0)
             geometryDocument.Delete(existingForms);
 
-        if (args.Preset is RotatableFamilyPreset.ElectricalSocket or RotatableFamilyPreset.ElectricalSocketSingle or RotatableFamilyPreset.ElectricalSocketQuadruple)
-            BuildElectricalSocket(geometryDocument, args.Preset);
+        if (args.Preset is RotatableFamilyPreset.ElectricalSocket or RotatableFamilyPreset.Test)
+            BuildBeveledSocket(geometryDocument, plateWidthMm: 85, plateHeightMm: 120, outletCentresMm: [(0, 25), (0, -25)]);
+        else if (args.Preset == RotatableFamilyPreset.ElectricalSocketSingle)
+            BuildBeveledSocket(geometryDocument, plateWidthMm: 85, plateHeightMm: 85, outletCentresMm: [(0, 0)]);
+        else if (args.Preset == RotatableFamilyPreset.ElectricalSocketQuadruple)
+            BuildBeveledSocket(geometryDocument, plateWidthMm: 140, plateHeightMm: 140, outletCentresMm: [(-27, 27), (27, 27), (-27, -27), (27, -27)]);
         else if (args.Preset == RotatableFamilyPreset.RectangularLightFixture)
             BuildRectangularLightFixture(geometryDocument, args.LightFixtureLength, args.LightFixtureWidth);
         else if (args.Preset == RotatableFamilyPreset.DataSocketDouble)
@@ -68,12 +72,122 @@ internal static class GeometryBuilder
         }
     }
 
+    // Beveled socket: back plate, raised panel, mitred bevel between them, and one recessed outlet per
+    // entry in outletCentresMm, each with contact pins and earth tabs.
+    private static void BuildBeveledSocket(Document nestedDocument, double plateWidthMm, double plateHeightMm, (double X, double Y)[] outletCentresMm)
+    {
+        // The panel is inset uniformly from the plate; the bevel spans the difference.
+        const double panelInsetMm = 10;
+        const double plateDepthMm = 5;
+        var panelWidthMm = plateWidthMm - 2 * panelInsetMm;
+        var panelHeightMm = plateHeightMm - 2 * panelInsetMm;
+        var plateDepth = UnitUtils.ConvertToInternalUnits(plateDepthMm, UnitTypeId.Millimeters);
+
+        var sketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument));
+        nestedDocument.FamilyCreate.NewExtrusion(true, ProfileFactory.BuildRectangleProfile(plateWidthMm, plateHeightMm), sketchPlane, plateDepth);
+
+        const double panelDepthMm = 4;
+        const double panelGapMm = 0;
+        var panelDepth = UnitUtils.ConvertToInternalUnits(panelDepthMm, UnitTypeId.Millimeters);
+
+        var panelGap = UnitUtils.ConvertToInternalUnits(panelGapMm, UnitTypeId.Millimeters);
+        var panelSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, plateDepth + panelGap));
+        var panel = nestedDocument.FamilyCreate.NewExtrusion(true, ProfileFactory.BuildRectangleProfile(panelWidthMm, panelHeightMm), panelSketchPlane, panelDepth);
+
+        // Extrusion 3: bevel rising from extrusion 1's front face and dying into extrusion 2's side.
+        // Both loops are positioned in world Z so the base starts on the plate face, not at the origin.
+        const double bevelTopMm = 9;
+        var bevelBase = plateDepth;
+        var bevelTop = UnitUtils.ConvertToInternalUnits(bevelTopMm, UnitTypeId.Millimeters);
+        var bevelSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, bevelBase));
+        var bevel = nestedDocument.FamilyCreate.NewBlend(
+            true,
+            BuildRectangleLoopAtDepth(panelWidthMm, panelHeightMm, bevelTop),
+            BuildRectangleLoopAtDepth(plateWidthMm, plateHeightMm, bevelBase),
+            bevelSketchPlane);
+
+        // Extrusion 4: one 40mm opening per outlet. These must be true voids because the bevel is a solid
+        // frustum filling the same Z range, so profile-loop holes in the panel alone would be plugged by it.
+        const double outletDiameterMm = 40;
+        var outletCentres = outletCentresMm
+            .Select(c => new XYZ(
+                UnitUtils.ConvertToInternalUnits(c.X, UnitTypeId.Millimeters),
+                UnitUtils.ConvertToInternalUnits(c.Y, UnitTypeId.Millimeters),
+                0))
+            .ToArray();
+
+        // Each opening is its own void: Revit reads disjoint loops in a single profile unreliably.
+        // The span deliberately overshoots the whole assembly so no cut face is coincident with a solid face.
+        var voidStart = UnitUtils.ConvertToInternalUnits(-5, UnitTypeId.Millimeters);
+        var voidEnd = UnitUtils.ConvertToInternalUnits(20, UnitTypeId.Millimeters);
+        var outletSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, voidStart));
+
+        var combinable = new CombinableElementArray();
+        combinable.Append(panel);
+        combinable.Append(bevel);
+
+        foreach (var centre in outletCentres)
+        {
+            var outletProfile = ProfileFactory.BuildCircleProfile(outletDiameterMm, centre.Y, centre.X);
+            combinable.Append(nestedDocument.FamilyCreate.NewExtrusion(false, outletProfile, outletSketchPlane, voidEnd - voidStart));
+        }
+
+        nestedDocument.CombineElements(combinable);
+
+        // Extrusion 5: two contact pins per outlet. Created after the void combine so they survive it.
+        // They rise from the recess floor to stand slightly proud of the bevel's front face.
+        const double pinDiameterMm = 4;
+        const double pinSpacingMm = 19;
+        const double pinProudMm = 1.0;
+        var pinOffset = UnitUtils.ConvertToInternalUnits(pinSpacingMm / 2, UnitTypeId.Millimeters);
+        var pinSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, plateDepth));
+        var pinDepth = bevelTop - plateDepth + UnitUtils.ConvertToInternalUnits(pinProudMm, UnitTypeId.Millimeters);
+
+        foreach (var centre in outletCentres)
+        foreach (var horizontalOffset in new[] { pinOffset, -pinOffset })
+        {
+            var pinProfile = ProfileFactory.BuildCircleProfile(pinDiameterMm, centre.Y, centre.X + horizontalOffset);
+            nestedDocument.FamilyCreate.NewExtrusion(true, pinProfile, pinSketchPlane, pinDepth);
+        }
+
+        // Extrusion 6: earth contacts at the top and bottom rim of each recess. Solid, and standing proud
+        // of the bevel's front face, since flush tabs merge invisibly into the surrounding material.
+        const double earthTabWidthMm = 3;
+        const double earthTabLengthMm = 3;
+        const double earthTabProudMm = 5;
+        var outletRadius = UnitUtils.ConvertToInternalUnits(outletDiameterMm / 2, UnitTypeId.Millimeters);
+        var earthTabLength = UnitUtils.ConvertToInternalUnits(earthTabLengthMm, UnitTypeId.Millimeters);
+        var earthDepth = bevelTop - plateDepth + UnitUtils.ConvertToInternalUnits(earthTabProudMm, UnitTypeId.Millimeters);
+
+        foreach (var centre in outletCentres)
+        foreach (var rimOffset in new[] { outletRadius, -outletRadius })
+        {
+            // Sit just inside the rim so the whole tab stands in open air rather than buried in the wall.
+            var tabCentre = rimOffset - Math.Sign(rimOffset) * earthTabLength / 2;
+            var earthProfile = new CurveArrArray();
+            earthProfile.Append(ProfileFactory.BuildRectangleLoop(earthTabWidthMm, earthTabLengthMm, centre.Y + tabCentre, centre.X));
+            nestedDocument.FamilyCreate.NewExtrusion(true, earthProfile, pinSketchPlane, earthDepth);
+        }
+    }
+
+    private static CurveArray BuildRectangleLoopAtDepth(double widthMm, double heightMm, double depth)
+    {
+        var loop = ProfileFactory.BuildRectangleLoop(widthMm, heightMm);
+        if (Math.Abs(depth) < 1e-9)
+            return loop;
+
+        var translated = new CurveArray();
+        var translation = Transform.CreateTranslation(new XYZ(0, 0, depth));
+        foreach (Curve segment in loop)
+            translated.Append(segment.CreateTransformed(translation));
+        return translated;
+    }
+
     // Wall plate with a raised inner panel carrying 1, 2 (stacked) or 4 (2x2 grid) recessed 40 mm outlets.
     private static void BuildElectricalSocket(Document nestedDocument, RotatableFamilyPreset preset)
     {
         const double outletDiameterMm = 40;
         const double pinDiameterMm = 5;
-        const double padSizeMm = 55;
 
         var isQuadruple = preset == RotatableFamilyPreset.ElectricalSocketQuadruple;
         var plateWidthMm = isQuadruple ? 120 : 85;
@@ -128,23 +242,55 @@ internal static class GeometryBuilder
 
         var topSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, backClosureDepth + backCutDepth + faceDepth));
 
-        // Each outlet gets a small, contained bevelled frame: a slightly wider base step under the
-        // original flat pad size, giving a subtle inclined edge without dwarfing the plate itself.
-        const double padBevelMarginMm = 4;
-        const double padBaseDepthMm = 10;
-        const double padCapDepthMm = 10;
-        var padBaseDepth = UnitUtils.ConvertToInternalUnits(padBaseDepthMm, UnitTypeId.Millimeters);
-        var padCapDepth = UnitUtils.ConvertToInternalUnits(padCapDepthMm, UnitTypeId.Millimeters);
+        // One shared bevelled frame runs around the whole plate: a step just inside the outer edge,
+        // sloping (in two flat stages) down to a smaller inset panel that both outlet holes are cut into.
+        // Kept modest so the inset panel still has enough room for a visibly wider dish around each
+        // outlet without the dish reaching the panel's own edge.
+        const double frameMarginMm = 6;
+        const double frameBaseDepthMm = 8;
+        const double frameCapDepthMm = 6;
+        var frameBaseDepth = UnitUtils.ConvertToInternalUnits(frameBaseDepthMm, UnitTypeId.Millimeters);
+        var frameCapDepth = UnitUtils.ConvertToInternalUnits(frameCapDepthMm, UnitTypeId.Millimeters);
 
+        var frameBaseProfile = ProfileFactory.BuildRoundedRectangleProfile(plateWidthMm - frameMarginMm, plateHeightMm - frameMarginMm, 8);
+        nestedDocument.FamilyCreate.NewExtrusion(true, frameBaseProfile, topSketchPlane, frameBaseDepth);
+
+        var frameCapSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, backClosureDepth + backCutDepth + faceDepth + frameBaseDepth));
+        var frameCapProfile = ProfileFactory.BuildRoundedRectangleProfile(plateWidthMm - frameMarginMm * 2, plateHeightMm - frameMarginMm * 2, 6);
         foreach (var (verticalOffset, horizontalOffset) in outletCentres)
-        {
-            var baseProfile = ProfileFactory.BuildRoundedRectangleProfile(padSizeMm + padBevelMarginMm * 2, padSizeMm + padBevelMarginMm * 2, 6, verticalOffset, horizontalOffset);
-            nestedDocument.FamilyCreate.NewExtrusion(true, baseProfile, topSketchPlane, padBaseDepth);
+            frameCapProfile.Append(ProfileFactory.BuildCircleLoop(outletDiameterMm, verticalOffset, horizontalOffset));
+        nestedDocument.FamilyCreate.NewExtrusion(true, frameCapProfile, frameCapSketchPlane, frameCapDepth);
 
-            var capSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, backClosureDepth + backCutDepth + faceDepth + padBaseDepth));
-            var capProfile = ProfileFactory.BuildRoundedRectangleProfile(padSizeMm, padSizeMm, 6, verticalOffset, horizontalOffset);
-            capProfile.Append(ProfileFactory.BuildCircleLoop(outletDiameterMm, verticalOffset, horizontalOffset));
-            nestedDocument.FamilyCreate.NewExtrusion(true, capProfile, capSketchPlane, padCapDepth);
+        // A raised collar sits around each outlet (not spanning the whole plate), shaped as a washer:
+        // a ring between the dish diameter and the outlet hole itself. Kept as small, self-contained
+        // shapes rather than one big rectangle with holes, since two full-size stacked rectangles with
+        // differently-sized coaxial holes silently failed to cut here (likely a Revit auto-join quirk).
+        // The dish is sized dynamically per preset: it must never reach the inset panel's own edge or an
+        // adjacent outlet's dish, or the resulting profile self-intersects.
+        var insetHalfWidthMm = (plateWidthMm - frameMarginMm * 2) / 2;
+        var insetHalfHeightMm = (plateHeightMm - frameMarginMm * 2) / 2;
+        var dishClearanceMm = outletCentres
+            .Select(c => Math.Min(
+                insetHalfWidthMm - Math.Abs(UnitUtils.ConvertFromInternalUnits(c.HorizontalOffset, UnitTypeId.Millimeters)),
+                insetHalfHeightMm - Math.Abs(UnitUtils.ConvertFromInternalUnits(c.VerticalOffset, UnitTypeId.Millimeters))))
+            .Min();
+        // 2mm safety margin from the clearance limit; never smaller than the outlet itself (i.e. no collar at all)
+        // if the preset's spacing leaves no room for a wider ring.
+        var dishRadiusMm = Math.Min(outletDiameterMm / 2 + 10, Math.Max(outletDiameterMm / 2, dishClearanceMm - 2));
+        var dishDiameterMm = dishRadiusMm * 2;
+        const double surroundDepthMm = 6;
+        var surroundDepth = UnitUtils.ConvertToInternalUnits(surroundDepthMm, UnitTypeId.Millimeters);
+
+        var surroundSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, backClosureDepth + backCutDepth + faceDepth + frameBaseDepth + frameCapDepth));
+        if (dishDiameterMm > outletDiameterMm)
+        {
+            foreach (var (verticalOffset, horizontalOffset) in outletCentres)
+            {
+                var collarProfile = new CurveArrArray();
+                collarProfile.Append(ProfileFactory.BuildCircleLoop(dishDiameterMm, verticalOffset, horizontalOffset));
+                collarProfile.Append(ProfileFactory.BuildCircleLoop(outletDiameterMm, verticalOffset, horizontalOffset));
+                nestedDocument.FamilyCreate.NewExtrusion(true, collarProfile, surroundSketchPlane, surroundDepth);
+            }
         }
     }
 

@@ -47,7 +47,7 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             SetFamilyCategory(familyDocument, args);
             RenameCurrentType(familyDocument, args.NewFamilyName);
 
-            var error = ReplaceOrientationGeometry(familyDocument, args, out var geometryHost);
+            var error = ReplaceOrientationGeometry(familyDocument, args, out var geometryHost, out var transformInfo);
             if (error is not null)
                 return Result.Text.Failed(error);
 
@@ -57,7 +57,7 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
-            return Result.Text.Succeeded($"Created rotatable family '{args.NewFamilyName}' and loaded it into the active document. Geometry was written into '{geometryHost}'.");
+            return Result.Text.Succeeded($"Created rotatable family '{args.NewFamilyName}' and loaded it into the active document. Geometry was written into '{geometryHost}'. {transformInfo}");
         }
         catch (Exception ex)
         {
@@ -107,9 +107,10 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
     // The nested "3D Orientation Family" is what the rotation parameters actually drive; geometry
     // added to the host family directly does not rotate, so the extrusion must live inside it.
-    private static string? ReplaceOrientationGeometry(Document familyDocument, FlexiRfaArgs args, out string geometryHost)
+    private static string? ReplaceOrientationGeometry(Document familyDocument, FlexiRfaArgs args, out string geometryHost, out string transformInfo)
     {
         geometryHost = "3D Orientation Family";
+        transformInfo = string.Empty;
 
         var nestedInstance = new FilteredElementCollector(familyDocument)
             .OfClass(typeof(FamilyInstance))
@@ -118,6 +119,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         if (nestedInstance is null)
             return "Could not find the nested '3D Orientation Family' in the family.";
+
+        var nestedTransform = nestedInstance.GetTransform();
+        transformInfo = $"[DIAG] 3D Orientation Family transform: Origin={FormatXyz(nestedTransform.Origin)}, BasisX={FormatXyz(nestedTransform.BasisX)}, BasisY={FormatXyz(nestedTransform.BasisY)}, BasisZ={FormatXyz(nestedTransform.BasisZ)}.";
 
         var nestedDocument = familyDocument.EditFamily(nestedInstance.Symbol.Family);
 
@@ -135,6 +139,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         }
         else
         {
+            var geometryTransform = geometryInstance.GetTransform();
+            transformInfo += $" [DIAG] {geometryInstance.Symbol.Family.Name} transform: Origin={FormatXyz(geometryTransform.Origin)}, BasisX={FormatXyz(geometryTransform.BasisX)}, BasisY={FormatXyz(geometryTransform.BasisY)}, BasisZ={FormatXyz(geometryTransform.BasisZ)}.";
+
             geometryHost = geometryInstance.Symbol.Family.Name;
             var geometryDocument = nestedDocument.EditFamily(geometryInstance.Symbol.Family);
             GeometryBuilder.ReplaceForms(geometryDocument, args);
@@ -147,6 +154,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         return null;
     }
+
+    // DIAGNOSTIC: readable vector formatting for transform reporting.
+    private static string FormatXyz(XYZ v) => $"({v.X:F2}, {v.Y:F2}, {v.Z:F2})";
 
     private static void TryDeleteDirectory(string path)
     {

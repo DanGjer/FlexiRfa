@@ -5,7 +5,7 @@
 		<DebugType>portable</DebugType>
 		<Nullable>enable</Nullable>
 		<NoWarn>NU1701</NoWarn>
-		<Configurations>Debug;Debug 2025;Debug 2026;Release 2025;Release 2026</Configurations>
+		<Configurations>Debug;Debug 2026;Release 2026</Configurations>
 	</PropertyGroup>
 
 	<Choose>
