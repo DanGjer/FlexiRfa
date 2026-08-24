@@ -21,6 +21,9 @@ public enum RotatableFamilyPreset
     [Description("Electrical Socket (Double)")]
     ElectricalSocket,
 
+    [Description("Test")]
+    Test,
+
     [Description("Electrical Socket (Single)")]
     ElectricalSocketSingle,
 

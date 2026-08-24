@@ -23,6 +23,8 @@ internal static class GeometryBuilder
 
         if (args.Preset == RotatableFamilyPreset.ElectricalSocket)
             BuildBeveledSocket(geometryDocument, plateWidthMm: 85, plateHeightMm: 120, outletCentresMm: [(0, 25), (0, -25)]);
+        else if (args.Preset == RotatableFamilyPreset.Test)
+            BuildBeveledSocket(geometryDocument, plateWidthMm: 63, plateHeightMm: 98, outletCentresMm: [(0, 25), (0, -25)], bevelTopMm: 16, frontPanelSizeMm: (52, 88), plateDepthMm: 32);
         else if (args.Preset == RotatableFamilyPreset.ElectricalSocketSingle)
             BuildBeveledSocket(geometryDocument, plateWidthMm: 85, plateHeightMm: 85, outletCentresMm: [(0, 0)]);
         else if (args.Preset == RotatableFamilyPreset.ElectricalSocketQuadruple)
@@ -116,6 +118,7 @@ internal static class GeometryBuilder
         double plateHeightMm,
         (double X, double Y)[] outletCentresMm,
         double bevelTopMm = 9,
+        (double Width, double Height)? frontPanelSizeMm = null,
         (double Width, double Height)? frontCapSizeMm = null,
         double? frontCapStartMm = null,
         double frontCapVerticalOffsetMm = 0,
@@ -126,15 +129,19 @@ internal static class GeometryBuilder
         (double X, double Y)[]? frontPortCentresMm = null,
         double? frontPortStartMm = null,
         double frontPortProudMm = 1,
+        double plateDepthMm = 5,
         bool includeOutletVoids = true,
         bool includeRoundPins = true,
         bool includeEarthTabs = true)
     {
-        // The panel is inset uniformly from the plate; the bevel spans the difference.
-        const double panelInsetMm = 10;
-        const double plateDepthMm = 5;
-        var panelWidthMm = plateWidthMm - 2 * panelInsetMm;
-        var panelHeightMm = plateHeightMm - 2 * panelInsetMm;
+        // The panel footprint controls the bevel's front footprint too, so custom presets can tune both together.
+        const double legacyPlateDepthMm = 5;
+        var depthShiftMm = plateDepthMm - legacyPlateDepthMm;
+
+        static double ShiftDepthMm(double legacyDepthMm, double shiftMm) => legacyDepthMm + shiftMm;
+
+        var panelWidthMm = frontPanelSizeMm?.Width ?? plateWidthMm - 20;
+        var panelHeightMm = frontPanelSizeMm?.Height ?? plateHeightMm - 20;
         var plateDepth = UnitUtils.ConvertToInternalUnits(plateDepthMm, UnitTypeId.Millimeters);
 
         var sketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument));
@@ -151,7 +158,7 @@ internal static class GeometryBuilder
         // Extrusion 3: bevel rising from extrusion 1's front face and dying into extrusion 2's side.
         // Both loops are positioned in world Z so the base starts on the plate face, not at the origin.
         var bevelBase = plateDepth;
-        var bevelTop = UnitUtils.ConvertToInternalUnits(bevelTopMm, UnitTypeId.Millimeters);
+        var bevelTop = UnitUtils.ConvertToInternalUnits(ShiftDepthMm(bevelTopMm, depthShiftMm), UnitTypeId.Millimeters);
         var bevelSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, bevelBase));
         var bevel = nestedDocument.FamilyCreate.NewBlend(
             true,
@@ -171,8 +178,8 @@ internal static class GeometryBuilder
 
         // Each opening is its own void: Revit reads disjoint loops in a single profile unreliably.
         // The span deliberately overshoots the whole assembly so no cut face is coincident with a solid face.
-        var voidStart = UnitUtils.ConvertToInternalUnits(-5, UnitTypeId.Millimeters);
-        var voidEnd = UnitUtils.ConvertToInternalUnits(20, UnitTypeId.Millimeters);
+        var voidStart = UnitUtils.ConvertToInternalUnits(ShiftDepthMm(-5, depthShiftMm), UnitTypeId.Millimeters);
+        var voidEnd = UnitUtils.ConvertToInternalUnits(ShiftDepthMm(20, depthShiftMm), UnitTypeId.Millimeters);
         var outletSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument, voidStart));
 
         var combinable = new CombinableElementArray();
@@ -195,7 +202,7 @@ internal static class GeometryBuilder
             // Front cap centered on the bevel front face.
             var frontCapSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument));
             var frontCap = nestedDocument.FamilyCreate.NewExtrusion(true, ProfileFactory.BuildRectangleProfile(cap.Width, cap.Height), frontCapSketchPlane, UnitUtils.ConvertToInternalUnits(1, UnitTypeId.Millimeters));
-            var capStart = UnitUtils.ConvertToInternalUnits(frontCapStartMm ?? bevelTopMm, UnitTypeId.Millimeters);
+            var capStart = UnitUtils.ConvertToInternalUnits(ShiftDepthMm(frontCapStartMm ?? bevelTopMm, depthShiftMm), UnitTypeId.Millimeters);
             var capVerticalOffset = UnitUtils.ConvertToInternalUnits(frontCapVerticalOffsetMm, UnitTypeId.Millimeters);
             ElementTransformUtils.MoveElement(nestedDocument, frontCap.Id, new XYZ(0, capVerticalOffset, capStart));
         }
@@ -204,7 +211,7 @@ internal static class GeometryBuilder
         {
             var secondFrontCapSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument));
             var secondFrontCap = nestedDocument.FamilyCreate.NewExtrusion(true, ProfileFactory.BuildRectangleProfile(secondCap.Width, secondCap.Height), secondFrontCapSketchPlane, UnitUtils.ConvertToInternalUnits(1, UnitTypeId.Millimeters));
-            var secondCapStart = UnitUtils.ConvertToInternalUnits(secondFrontCapStartMm ?? frontCapStartMm ?? bevelTopMm, UnitTypeId.Millimeters);
+            var secondCapStart = UnitUtils.ConvertToInternalUnits(ShiftDepthMm(secondFrontCapStartMm ?? frontCapStartMm ?? bevelTopMm, depthShiftMm), UnitTypeId.Millimeters);
             var secondCapVerticalOffset = UnitUtils.ConvertToInternalUnits(secondFrontCapVerticalOffsetMm, UnitTypeId.Millimeters);
             ElementTransformUtils.MoveElement(nestedDocument, secondFrontCap.Id, new XYZ(0, secondCapVerticalOffset, secondCapStart));
         }
@@ -212,7 +219,7 @@ internal static class GeometryBuilder
         if (frontPortSizeMm is { } portSize && frontPortCentresMm is { Length: > 0 } portCentres)
         {
             var frontPortSketchPlane = SketchPlane.Create(nestedDocument, ProfileFactory.GetHorizontalPlaneAtOrigin(nestedDocument));
-            var portStart = UnitUtils.ConvertToInternalUnits(frontPortStartMm ?? (frontCapStartMm ?? bevelTopMm), UnitTypeId.Millimeters);
+            var portStart = UnitUtils.ConvertToInternalUnits(ShiftDepthMm(frontPortStartMm ?? (frontCapStartMm ?? bevelTopMm), depthShiftMm), UnitTypeId.Millimeters);
             var portDepth = UnitUtils.ConvertToInternalUnits(frontPortProudMm, UnitTypeId.Millimeters);
 
             foreach (var centre in portCentres)
