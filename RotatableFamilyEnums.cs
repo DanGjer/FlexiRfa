@@ -35,9 +35,6 @@ public enum RotatableFamilyPreset
 
     [Description("Data Outlet (Single RJ45)")]
     DataOutletSingle,
-
-    [Description("Test")]
-    Test,
 }
 
 public enum ExtrusionProfileShape

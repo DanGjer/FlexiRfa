@@ -28,10 +28,6 @@ internal static class ConnectorBuilder
         [
             new ElectricalConnectorSpec(ElectricalSystemType.Data, ConnectorSide.Right),
         ],
-        [RotatableFamilyPreset.Test] =
-        [
-            new ElectricalConnectorSpec(ElectricalSystemType.PowerCircuit, ConnectorSide.Back),
-        ],
         [RotatableFamilyPreset.ElectricalSocket] =
         [
             new ElectricalConnectorSpec(ElectricalSystemType.PowerCircuit, ConnectorSide.Back),
