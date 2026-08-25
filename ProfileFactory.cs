@@ -10,7 +10,7 @@ namespace FlexiRfa;
 internal static class ProfileFactory
 {
     // Reference Level sits at the family origin, matching the "Center (Front/Back)" / "Center (Left/Right)" planes.
-    internal static Plane GetHorizontalPlaneAtOrigin(Document familyDocument, double zOffset = 0)
+    internal static Plane GetHorizontalPlaneAtOrigin(Document familyDocument, double zOffset = 0, bool reverseNormal = false)
     {
         var level = new FilteredElementCollector(familyDocument)
             .OfClass(typeof(Level))
@@ -19,7 +19,8 @@ internal static class ProfileFactory
             .FirstOrDefault();
 
         var elevation = level?.Elevation ?? 0;
-        return Plane.CreateByNormalAndOrigin(XYZ.BasisZ, new XYZ(0, 0, elevation + zOffset));
+        var normal = reverseNormal ? -XYZ.BasisZ : XYZ.BasisZ;
+        return Plane.CreateByNormalAndOrigin(normal, new XYZ(0, 0, elevation + zOffset));
     }
 
     internal static CurveArrArray BuildRectangleProfile(double widthMm, double depthMm)

@@ -57,7 +57,7 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
-            return Result.Text.Succeeded($"Created rotatable family '{args.NewFamilyName}' and loaded it into the active document. Geometry was written into '{geometryHost}'. {transformInfo}");
+            return Result.Text.Succeeded($"Created rotatable family '{args.NewFamilyName}' and loaded it into the active document. Geometry was written into '{geometryHost}'. {transformInfo} {GeometryBuilder.LastDebugInfo}");
         }
         catch (Exception ex)
         {
