@@ -10,48 +10,53 @@ public class FlexiRfaArgs
 {
     private const double DefaultDimensionMm = 200;
 
-    [FilePickerField(Label = "Family template", ToolTip = "The .rft template used to create the new family", FileExtensions = ["rft", "rfa"])]
+    private const string CreateNewVisibility = $"{nameof(Mode)} == 'CreateNew'";
+
+    [OptionsField(Label = "Mode", ToolTip = "Create a new rotatable family, or rotatify an existing family")]
+    public FlexiRfaMode Mode { get; set; } = FlexiRfaMode.CreateNew;
+
+    [FilePickerField(Label = "Family template", ToolTip = "The rotatable .rfa template that geometry is written into", FileExtensions = ["rft", "rfa"])]
     [Required(ErrorMessage = "A family template is required.")]
     public string TemplatePath { get; set; } = @"O:\A005000\A008170\EL\Utvikling\Roterbare familier\Roterbar Familie Template.rfa";
 
-    [TextField(Label = "New family name")]
+    [TextField(Label = "New family name", Visibility = CreateNewVisibility)]
     [Required(ErrorMessage = "New family name is required.")]
     public string NewFamilyName { get; set; } = string.Empty;
 
-    [OptionsField(Label = "Family category", ToolTip = "Revit category the generated family is assigned to", CollectorType = typeof(ElectricalCategoryCollector), CollectorSortOrder = SortOrder.SortByAscending)]
+    [OptionsField(Label = "Family category", ToolTip = "Revit category the generated family is assigned to", CollectorType = typeof(ElectricalCategoryCollector), CollectorSortOrder = SortOrder.SortByAscending, Visibility = CreateNewVisibility)]
     public string? FamilyCategory { get; set; }
 
-    [OptionsField(Label = "Preset", ToolTip = "Preset dimensions for common fixture types")]
+    [OptionsField(Label = "Preset", ToolTip = "Preset dimensions for common fixture types", Visibility = CreateNewVisibility)]
     public RotatableFamilyPreset Preset { get; set; } = RotatableFamilyPreset.Custom;
 
-    [OptionsField(Label = "Profile shape", Visibility = $"{nameof(Preset)} == 'Custom'")]
+    [OptionsField(Label = "Profile shape", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Custom'")]
     public ExtrusionProfileShape ProfileShape { get; set; } = ExtrusionProfileShape.Box;
 
-    [DoubleField(Label = "Width (mm)", ToolTip = "Rectangular profile width", Visibility = $"{nameof(Preset)} == 'Custom' && {nameof(ProfileShape)} == 'Box'")]
+    [DoubleField(Label = "Width (mm)", ToolTip = "Rectangular profile width", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Custom' && {nameof(ProfileShape)} == 'Box'")]
     public double Width { get; set; } = DefaultDimensionMm;
 
-    [DoubleField(Label = "Height (mm)", ToolTip = "Rectangular profile height", Visibility = $"{nameof(Preset)} == 'Custom' && {nameof(ProfileShape)} == 'Box'")]
+    [DoubleField(Label = "Height (mm)", ToolTip = "Rectangular profile height", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Custom' && {nameof(ProfileShape)} == 'Box'")]
     public double Height { get; set; } = DefaultDimensionMm;
 
-    [DoubleField(Label = "Diameter (mm)", ToolTip = "Circular profile diameter", Visibility = $"{nameof(Preset)} == 'Custom' && {nameof(ProfileShape)} == 'Cylinder'")]
+    [DoubleField(Label = "Diameter (mm)", ToolTip = "Circular profile diameter", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Custom' && {nameof(ProfileShape)} == 'Cylinder'")]
     public double Diameter { get; set; } = DefaultDimensionMm;
 
-    [DoubleField(Label = "Depth (mm)", ToolTip = "Extrusion depth", Visibility = $"{nameof(Preset)} == 'Custom'")]
+    [DoubleField(Label = "Depth (mm)", ToolTip = "Extrusion depth", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Custom'")]
     public double Depth { get; set; } = DefaultDimensionMm;
 
-    [DoubleField(Label = "Downlight diameter (mm)", ToolTip = "Recessed body diameter", Visibility = $"{nameof(Preset)} == 'Downlight'")]
+    [DoubleField(Label = "Downlight diameter (mm)", ToolTip = "Recessed body diameter", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Downlight'")]
     public double DownlightDiameter { get; set; } = 200;
 
-    [DoubleField(Label = "Smoke detector diameter (mm)", ToolTip = "Sensor chamber diameter; the ceiling plate stays 25 mm wider", Visibility = $"{nameof(Preset)} == 'SmokeDetector'")]
+    [DoubleField(Label = "Smoke detector diameter (mm)", ToolTip = "Sensor chamber diameter; the ceiling plate stays 25 mm wider", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'SmokeDetector'")]
     public double SmokeDetectorDiameter { get; set; } = 85;
 
-    [DoubleField(Label = "Fixture length (mm)", ToolTip = "Overall length of the luminaire housing", Visibility = $"{nameof(Preset)} == 'RectangularLightFixture'")]
+    [DoubleField(Label = "Fixture length (mm)", ToolTip = "Overall length of the luminaire housing", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'RectangularLightFixture'")]
     public double LightFixtureLength { get; set; } = 1200;
 
-    [DoubleField(Label = "Fixture width (mm)", ToolTip = "Overall width of the luminaire housing", Visibility = $"{nameof(Preset)} == 'RectangularLightFixture'")]
+    [DoubleField(Label = "Fixture width (mm)", ToolTip = "Overall width of the luminaire housing", Visibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'RectangularLightFixture'")]
     public double LightFixtureWidth { get; set; } = 100;
 
-    private const string CustomConnectorVisibility = $"{nameof(Preset)} == 'Custom'";
+    private const string CustomConnectorVisibility = $"{CreateNewVisibility} && {nameof(Preset)} == 'Custom'";
 
     [BooleanField(Label = "Power connector", ToolTip = "Add a power circuit connector", Visibility = CustomConnectorVisibility)]
     public bool AddPowerConnector { get; set; }

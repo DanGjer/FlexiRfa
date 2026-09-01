@@ -7,6 +7,15 @@
 
 namespace FlexiRfa;
 
+public enum FlexiRfaMode
+{
+    [Description("Create New RFA")]
+    CreateNew,
+
+    [Description("Rotatify")]
+    Rotatify,
+}
+
 public enum RotatableFamilyPreset
 {
     [Description("Custom")]
