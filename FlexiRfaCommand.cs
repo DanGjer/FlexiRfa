@@ -6,6 +6,7 @@
 //-----------------------------------------------------------------------------
 
 using Autodesk.Revit.DB.Electrical;
+using Autodesk.Revit.DB.Structure;
 
 namespace FlexiRfa;
 
@@ -45,11 +46,19 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             return Result.Text.Failed("Select an instance of the non-rotatable family in the model before running Rotatify mode.");
 
         var sourceFamily = selectedInstance.Symbol.Family;
+        var sourceFamilyName = sourceFamily.Name;
         var sourceTypeName = selectedInstance.Symbol.Name;
-        var newFamilyName = $"{sourceFamily.Name} Replacement";
+        var newFamilyName = $"{sourceFamilyName} Replacement";
 
         if (FamilyNameExists(activeDocument, newFamilyName))
             return Result.Text.Failed($"A family named '{newFamilyName}' already exists in this document.");
+
+        // Abort entirely (before any work starts) if the source family or any of its placed instances
+        // are owned by another user in a workshared model - a partial run that then can't swap/delete
+        // elements someone else is editing is worse than not starting at all.
+        var ownershipError = CheckOwnership(activeDocument, sourceFamily);
+        if (ownershipError is not null)
+            return Result.Text.Failed(ownershipError);
 
         var application = activeDocument.Application;
         var workingDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -58,7 +67,6 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         Document? familyDocument = null;
         Document? sourceDocument = null;
-        var nestedSourceDocuments = new List<Document>();
         var copyResult = default((int Copied, int Failed, string Diagnostics));
 
         try
@@ -71,11 +79,33 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
             sourceDocument = activeDocument.EditFamily(sourceFamily);
 
-            // The rotatable template's default (0-rotation) orientation keeps its thinnest extent along
-            // local Z. Some source families (e.g. wall sockets) instead keep their thinnest extent along
-            // Y (the common wall-hosted convention: X=width along wall, Y=depth into wall, Z=vertical) -
-            // detected from the source's own geometry bounding box, not guessed or hardcoded.
-            var orientationCorrection = DetermineOrientationCorrection(sourceDocument, out var orientationDiagnostics);
+            // Guard against rotatifying an already-rotatable family - if the source already contains a
+            // nested "3D Orientation Family" (the structural fingerprint of this same template), running
+            // Rotatify again would be redundant and could produce a confusing doubly-nested structure.
+            if (IsAlreadyRotatable(sourceDocument))
+                return Result.Text.Failed($"'{sourceFamilyName}' already appears to be a rotatable family (it already contains a nested '3D Orientation Family'). Rotatify is meant for non-rotatable source families only.");
+
+            // NOTE: geometry is nested as-authored (Transform.Identity placement, then rotated as one
+            // rigid instance) - the rotatable template has its own "Placement_CW" instance parameter
+            // (Wall/Ceiling/Floor) with a formula that rotates the whole assembly automatically.
+            // Pre-rotating the geometry beyond the fixed yaw correction below would double up with that
+            // mechanism - mounting is instead handled by setting Placement_CW per swapped instance in
+            // ReplaceInstancesOfSourceFamily.
+            // SEPARATE issue, same magnitude but a DIFFERENT axis: the template's nested
+            // "magiFamilyGeom Geometry" family has a CONSTANT, fixed 180 deg yaw baked into its own
+            // placement transform (BasisX=(-1,0,0), BasisY=(0,-1,0), BasisZ=(0,0,1) - every run, every
+            // family, unconditionally). Correcting for it here, universally - this is not a per-source
+            // guess like Placement_CW, it's undoing a constant property of the template itself.
+            // HISTORY: earlier attempts copied individual GenericForm elements out of the source family
+            // and tried to rotate/mirror each one - this hit a long tail of Revit-specific breakage
+            // (Blend elements corrupting under rotation, forms joined to each other blocking on rotate,
+            // sketches with labeled dimensions refusing to copy at all). REPLACED (2026-09-02) with
+            // `NestSourceFamilyAsGeometry`, which loads the WHOLE source family as one nested instance
+            // and rotates that single instance instead - none of the above applies to a single rigid
+            // instance rotation, and the 2D symbol/3D geometry facing relationship is preserved for free
+            // since both live inside the same untouched source family.
+            var orientationAxis = XYZ.BasisZ;
+            var orientationAngle = Math.PI;
 
             SetFamilyCategoryByName(familyDocument, sourceFamily.FamilyCategory?.Name);
             RenameCurrentType(familyDocument, sourceTypeName);
@@ -85,9 +115,15 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             var typeParamResult = CopyTypeParametersFromSource(selectedInstance.Symbol, familyDocument);
 
             var error = ReplaceOrientationGeometry(familyDocument, args, out var geometryHost, out var transformInfo,
-                geometryDocument => copyResult = CopyFormsFromSource(sourceDocument, geometryDocument, nestedSourceDocuments, orientationCorrection));
+                geometryDocument => copyResult = NestSourceFamilyAsGeometry(sourceDocument, sourceFamilyName, geometryDocument, orientationAxis, orientationAngle));
             if (error is not null)
                 return Result.Text.Failed(error);
+
+            // Abort BEFORE touching the active document at all if geometry nesting produced nothing -
+            // otherwise the steps below would happily load an empty family and swap real instances onto
+            // it, which is far worse than just failing here.
+            if (copyResult.Copied == 0)
+                return Result.Text.Failed($"Failed to nest '{sourceFamilyName}' as geometry - no instances were touched.{copyResult.Diagnostics}");
 
             try
             {
@@ -98,17 +134,17 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             }
             catch (Exception ex)
             {
-                return Result.Text.Failed($"Copied {copyResult.Copied} form(s), but the resulting family failed to regenerate: {ex.Message}{copyResult.Diagnostics}");
+                return Result.Text.Failed($"Nested source geometry ({copyResult.Copied}), but the resulting family failed to regenerate: {ex.Message}{copyResult.Diagnostics}");
             }
 
             // Connectors must be created on the TOP-LEVEL family document (referencing nested symbol
             // geometry), same as ConnectorBuilder.RebuildConnectors in CreateNewFamily - creating them
             // on the innermost geometry document orphans them once the nested docs load back up.
-            var connectorResult = CopyConnectorsFromSource(sourceDocument, familyDocument, orientationCorrection);
+            var connectorResult = CopyConnectorsFromSource(sourceDocument, familyDocument, Transform.CreateRotation(orientationAxis, orientationAngle));
 
             // The 2D plan symbol is a nested "Generic Annotations" family instance sitting directly in
             // the TOP-LEVEL source family (not inside the 3D geometry), so it's copied the same way.
-            var symbolResult = CopyGenericAnnotationsFromSource(sourceDocument, familyDocument, orientationCorrection);
+            var symbolResult = CopyGenericAnnotationsFromSource(sourceDocument, familyDocument);
 
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
@@ -117,11 +153,31 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
                 .Cast<Family>()
                 .FirstOrDefault(f => f.Name.Equals(newFamilyName, StringComparison.OrdinalIgnoreCase));
 
+            // Parameters not embedded in the family itself (e.g. MagiCAD's "MC ..." params) are often
+            // PROJECT parameters bound to categories like Electrical Fixtures - they only become available
+            // on the type once the family is actually loaded into the project under that category.
+            var loadedSymbol = loadedFamily?.GetFamilySymbolIds()
+                .Select(activeDocument.GetElement)
+                .OfType<FamilySymbol>()
+                .FirstOrDefault();
+
+            var projectBindingResult = loadedSymbol is not null
+                ? ApplyProjectBoundParameters(activeDocument, loadedSymbol, typeParamResult.Unmatched)
+                : (Copied: 0, Diagnostics: string.Empty);
+
             var replaceResult = loadedFamily is null
                 ? (Replaced: 0, Failed: 0, Diagnostics: $"[DBG] Could not find loaded family '{newFamilyName}' in the active document to replace instances with.")
                 : ReplaceInstancesOfSourceFamily(activeDocument, sourceFamily, loadedFamily, sourceTypeName);
 
-            var message = $"[ROTATIFY] Copied {copyResult.Copied} form(s) from '{sourceFamily.Name}' into '{geometryHost}' of '{newFamilyName}' (type '{sourceTypeName}') and loaded it into the active document. {transformInfo}{orientationDiagnostics}{copyResult.Diagnostics} {connectorResult.Diagnostics} {symbolResult.Diagnostics} {typeParamResult.Diagnostics} {replaceResult.Diagnostics}";
+            // Only delete the source family once every instance has actually been moved off it - a
+            // partial replace (some instances failed the swap) must NOT delete the family they still use.
+            // Once deleted, the "Replacement" suffix no longer makes sense - the new family takes over
+            // the source's original name entirely.
+            var deleteSourceResult = loadedFamily is null
+                ? (Deleted: false, Diagnostics: string.Empty)
+                : DeleteSourceFamilyIfUnused(activeDocument, sourceFamily, loadedFamily);
+
+            var message = $"[ROTATIFY] Nested '{sourceFamilyName}' as geometry into '{geometryHost}' of '{newFamilyName}' (type '{sourceTypeName}') and loaded it into the active document. {transformInfo}{copyResult.Diagnostics} {connectorResult.Diagnostics} {symbolResult.Diagnostics} {typeParamResult.Diagnostics} {projectBindingResult.Diagnostics} {replaceResult.Diagnostics} {deleteSourceResult.Diagnostics}";
             return copyResult.Failed > 0 && copyResult.Copied == 0
                 ? Result.Text.Failed(message)
                 : Result.Text.Succeeded(message);
@@ -129,12 +185,10 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         catch (Exception ex)
         {
             var innerMessage = ex.InnerException is not null ? $" | Inner: {ex.InnerException.Message}" : string.Empty;
-            return Result.Text.Failed($"Rotatify mode failed: {ex.Message}{innerMessage} [DBG] Copied {copyResult.Copied} form(s) before failure.{copyResult.Diagnostics} {ex.GetType().Name} at: {ex.StackTrace}");
+            return Result.Text.Failed($"Rotatify mode failed: {ex.Message}{innerMessage} [DBG] Nested source geometry: {copyResult.Copied} before failure.{copyResult.Diagnostics} {ex.GetType().Name} at: {ex.StackTrace}");
         }
         finally
         {
-            foreach (var nestedDocument in nestedSourceDocuments)
-                nestedDocument.Close(false);
             sourceDocument?.Close(false);
             familyDocument?.Close(false);
             TryDeleteDirectory(workingDirectory);
@@ -172,14 +226,31 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             .ToList();
 
         var replaced = 0;
+        var placementSet = 0;
         var failures = new List<string>();
 
         foreach (var instance in instancesToReplace)
         {
+            // Determine the instance's REAL mounting (Wall/Ceiling/Floor) from its host/hosted face
+            // BEFORE swapping, then set it on the swapped instance so the template's own "Placement_CW"
+            // formula (0=Wall +90 deg, 1=Ceiling +0 deg, 2=Floor +180 deg) orients it correctly - this
+            // is what the template is actually designed to use, instead of us pre-rotating geometry.
+            var mountingType = DetermineMountingType(instance);
+
             try
             {
                 instance.Symbol = newSymbol;
                 replaced++;
+
+                if (mountingType is not null)
+                {
+                    var placementParam = instance.LookupParameter("Placement_CW");
+                    if (placementParam is not null && !placementParam.IsReadOnly)
+                    {
+                        placementParam.Set(mountingType.Value);
+                        placementSet++;
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -189,11 +260,106 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         transaction.Commit();
 
-        var diagnostics = $"[ROTATIFY] Replaced {replaced}/{instancesToReplace.Count} instance(s) of '{sourceFamily.Name}' with '{newSymbol.Name}'.";
+        var diagnostics = $"[ROTATIFY] Replaced {replaced}/{instancesToReplace.Count} instance(s) of '{sourceFamily.Name}' with '{newSymbol.Name}' (mounting set on {placementSet}).";
         if (failures.Count > 0)
             diagnostics += $" [DBG] {failures.Count} instance(s) failed to replace: {string.Join("; ", failures)}";
 
         return (replaced, failures.Count, diagnostics);
+    }
+
+    // Determines an instance's REAL mounting surface, physically, from its actual placement - not from
+    // guessing at the source family's geometry proportions. Returns the value expected by the rotatable
+    // template's "Placement_CW" parameter: 0 = Wall, 1 = Ceiling, 2 = Floor, or null if undeterminable.
+    private static int? DetermineMountingType(FamilyInstance instance)
+    {
+        switch (instance.Host)
+        {
+            case Wall:
+                return 0;
+            case Ceiling:
+                return 1;
+            case Floor:
+                return 2;
+        }
+
+        // Face-hosted (e.g. Generic Model face-based) instances aren't hosted by a category-typed
+        // element - resolve the actual host face's normal instead. A face whose normal points mostly
+        // down means the device hangs below it (ceiling); mostly up means it sits on top (floor);
+        // otherwise it's roughly vertical, i.e. a wall.
+        try
+        {
+            var hostFaceReference = instance.HostFace;
+            if (hostFaceReference is not null)
+            {
+                var document = instance.Document;
+                var hostElement = document.GetElement(hostFaceReference);
+                if (hostElement?.GetGeometryObjectFromReference(hostFaceReference) is Face face)
+                {
+                    var normal = face.ComputeNormal(new UV(0.5, 0.5));
+                    var verticalAlignment = normal.DotProduct(XYZ.BasisZ);
+                    if (verticalAlignment < -0.5)
+                        return 1; // Ceiling
+                    if (verticalAlignment > 0.5)
+                        return 2; // Floor
+
+                    return 0; // Wall
+                }
+            }
+        }
+        catch
+        {
+            // fall through to the geometric fallback below
+        }
+
+        // Genuinely non-hosted (e.g. plain point-based) instances carry NO host metadata at all - this
+        // is a best-effort guess rather than a reliable signal, since we're copying geometry as-authored
+        // (Transform.Identity) and can't otherwise know which local axis the source treats as "depth".
+        // If the instance's own local Z ends up roughly vertical in the world, assume that's the
+        // mounting-normal direction (Ceiling if it points down, Floor if up); otherwise assume Wall.
+        // Worst case the user has to manually correct Placement_CW - acceptable given there's no
+        // reliable signal to work with for this class of family.
+        var basisZ = instance.GetTransform().BasisZ;
+        var verticalAlignmentFallback = basisZ.DotProduct(XYZ.BasisZ);
+        if (Math.Abs(verticalAlignmentFallback) < 0.5)
+            return 0; // Wall
+
+        return verticalAlignmentFallback < 0 ? 1 : 2; // Ceiling if pointing down, Floor if pointing up
+    }
+
+    // Deletes the source family from the active project, but ONLY if zero placed instances still
+    // reference it (any type) - a real, explicit safety gate, not an assumption based on the replace
+    // step's reported counts, in case some instances were missed or failed silently elsewhere. Once
+    // deleted, the source's original name is free again, so the "Replacement" family is renamed to take
+    // it over completely - both steps share one transaction, so a rename failure rolls back the delete
+    // too rather than leaving the project in a half-finished state.
+    private static (bool Deleted, string Diagnostics) DeleteSourceFamilyIfUnused(Document activeDocument, Family sourceFamily, Family loadedFamily)
+    {
+        var sourceFamilyName = sourceFamily.Name;
+
+        var remainingInstanceCount = new FilteredElementCollector(activeDocument)
+            .OfClass(typeof(FamilyInstance))
+            .WhereElementIsNotElementType()
+            .Cast<FamilyInstance>()
+            .Count(instance => instance.Symbol.Family.Id == sourceFamily.Id);
+
+        if (remainingInstanceCount > 0)
+            return (false, $"[ROTATIFY] Source family '{sourceFamilyName}' NOT deleted - {remainingInstanceCount} instance(s) still reference it.");
+
+        using var transaction = new Transaction(activeDocument, "Delete rotatified source family");
+        transaction.Start();
+
+        try
+        {
+            activeDocument.Delete(sourceFamily.Id);
+            loadedFamily.Name = sourceFamilyName;
+            transaction.Commit();
+            return (true, $"[ROTATIFY] Deleted source family '{sourceFamilyName}' (0 remaining instances) and renamed the new family to take over its name.");
+        }
+        catch (Exception ex)
+        {
+            transaction.RollBack();
+            return (false, $"[ROTATIFY] Could not delete/rename source family '{sourceFamilyName}': {ex.Message}");
+        }
     }
 
     // Recreates each ELECTRICAL connector found on the source family, hosted on the destination's
@@ -234,14 +400,34 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             {
                 var systemType = Enum.Parse<ElectricalSystemType>(sourceConnector.SystemClassification.ToString());
                 var correctedDirection = orientationCorrection.OfVector(sourceConnector.Direction);
-                var hostFace = ConnectorBuilder.GetClosestFace(destinationSolid, correctedDirection);
+
+                // Prefer a face closely matching the source connector's direction, but exact placement
+                // isn't critical - what matters is that A connector exists with the right attributes.
+                // Falls back to whichever planar face is the closest available match if nothing is
+                // within the strict tolerance (e.g. geometry that ends up mirrored/rotated differently
+                // than expected shouldn't leave the type with zero connectors).
+                var hostFace = ConnectorBuilder.GetClosestFace(destinationSolid, correctedDirection)
+                    ?? destinationSolid.Faces
+                        .OfType<PlanarFace>()
+                        .Where(f => f.Reference is not null)
+                        .OrderByDescending(f => f.FaceNormal.DotProduct(correctedDirection))
+                        .FirstOrDefault();
+
                 if (hostFace is null)
                 {
-                    failures.Add($"#{sourceConnector.Id} ({systemType}): no matching destination face found");
+                    failures.Add($"#{sourceConnector.Id} ({systemType}): no destination face found at all");
                     continue;
                 }
 
-                ConnectorElement.CreateElectricalConnector(destinationDocument, systemType, hostFace.Reference);
+                var newConnector = ConnectorElement.CreateElectricalConnector(destinationDocument, systemType, hostFace.Reference);
+
+                // Circuits validate against more than just SystemClassification (Voltage, Number of
+                // Poles, Apparent Power/Load, Power Factor, Load Classification, etc.) - a bare connector
+                // with Revit's defaults for these makes existing circuits consider the family "no longer
+                // matching the properties for the Circuit" and prompt to disconnect. Copying every
+                // settable parameter value keeps a swapped-in instance's circuit membership intact.
+                CopyConnectorParameterValues(sourceConnector, newConnector);
+
                 copied++;
             }
             catch (Exception ex)
@@ -259,12 +445,53 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         return (copied, failures.Count, diagnostics);
     }
 
+    // Copies every settable parameter value (Voltage, Number of Poles, Apparent Power, Power Factor,
+    // Load Classification, etc.) from the source connector onto the newly created destination
+    // connector, matched by name. Without this, circuits built against the source instance consider
+    // the swapped-in family "no longer matching the properties for the Circuit" and prompt to
+    // disconnect, since `CreateElectricalConnector` only sets SystemClassification and leaves
+    // everything else at Revit's bare defaults.
+    private static void CopyConnectorParameterValues(ConnectorElement sourceConnector, ConnectorElement destinationConnector)
+    {
+        foreach (Parameter sourceParam in sourceConnector.Parameters)
+        {
+            if (!sourceParam.HasValue)
+                continue;
+
+            var destinationParam = destinationConnector.LookupParameter(sourceParam.Definition.Name);
+            if (destinationParam is null || destinationParam.IsReadOnly || destinationParam.StorageType != sourceParam.StorageType)
+                continue;
+
+            try
+            {
+                switch (sourceParam.StorageType)
+                {
+                    case StorageType.Double:
+                        destinationParam.Set(sourceParam.AsDouble());
+                        break;
+                    case StorageType.Integer:
+                        destinationParam.Set(sourceParam.AsInteger());
+                        break;
+                    case StorageType.String:
+                        var stringValue = sourceParam.AsString();
+                        if (stringValue is not null)
+                            destinationParam.Set(stringValue);
+                        break;
+                }
+            }
+            catch
+            {
+                // Best-effort - some connector parameters (e.g. read-only computed ones not caught by
+                // IsReadOnly) can still reject a Set call; skipping one shouldn't abort the connector copy.
+            }
+        }
+    }
+
     // Copies the nested "Generic Annotations" family instance(s) that act as the 2D/coarse-detail
     // plan symbol - a separate concept from the 3D GenericForm geometry, so it needs its own pass.
-    // The 2D plan symbol is inherently flat/view-facing, unlike the 3D body geometry - it is NOT
-    // rotated by `orientationCorrection` (that broke the copy when tried), so this parameter is unused
-    // for now but kept for signature symmetry with the other Copy*FromSource methods.
-    private static (int Copied, int Failed, string Diagnostics) CopyGenericAnnotationsFromSource(Document sourceDocument, Document destinationDocument, Transform orientationCorrection)
+    // The 2D plan symbol is inherently flat/view-facing, unlike the 3D body geometry - it is inserted
+    // as-is (no rotation correction; applying one broke the copy when tried).
+    private static (int Copied, int Failed, string Diagnostics) CopyGenericAnnotationsFromSource(Document sourceDocument, Document destinationDocument)
     {
         var sourceAnnotationInstances = new FilteredElementCollector(sourceDocument)
             .OfClass(typeof(FamilyInstance))
@@ -321,8 +548,11 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
     // touched here - they live per-instance in the project and are preserved automatically by
     // `instance.Symbol = newSymbol` in ReplaceInstancesOfSourceFamily. ElementId-valued params
     // (materials, etc.) are skipped since an ElementId from the source document is meaningless in the
-    // destination document.
-    private static (int Copied, int Skipped, string Diagnostics) CopyTypeParametersFromSource(FamilySymbol sourceSymbol, Document destinationDocument)
+    // destination document. Source parameters with no matching FAMILY parameter are returned as
+    // `Unmatched` rather than dropped - many of those (e.g. MagiCAD's "MC ..." params) are actually
+    // PROJECT parameters bound to the family's category, which only become settable once the family is
+    // loaded into the project; see `ApplyProjectBoundParameters`.
+    private static (int Copied, int Skipped, string Diagnostics, List<Parameter> Unmatched) CopyTypeParametersFromSource(FamilySymbol sourceSymbol, Document destinationDocument)
     {
         var destinationFamilyManager = destinationDocument.FamilyManager;
         var destinationParams = destinationFamilyManager.Parameters.Cast<FamilyParameter>().ToList();
@@ -331,33 +561,19 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         transaction.Start();
 
         var copied = 0;
-        var added = 0;
         var skipped = new List<string>();
+        var unmatched = new List<Parameter>();
 
         foreach (var sourceParam in sourceSymbol.Parameters.Cast<Parameter>())
         {
             var destinationParam = destinationParams
                 .FirstOrDefault(p => p.Definition.Name.Equals(sourceParam.Definition.Name, StringComparison.OrdinalIgnoreCase));
 
-            // The destination template doesn't necessarily define every shared parameter the source
-            // uses (e.g. MagiCAD-specific ones like "MC Default System Code") - add it on the fly using
-            // the SAME shared parameter definition, rather than silently dropping the value.
             if (destinationParam is null)
             {
-                if (!sourceParam.IsShared || sourceParam.Definition is not ExternalDefinition externalDefinition)
-                    continue;
-
-                try
-                {
-                    destinationParam = destinationFamilyManager.AddParameter(externalDefinition, sourceParam.Definition.GetGroupTypeId(), isInstance: false);
-                    destinationParams.Add(destinationParam);
-                    added++;
-                }
-                catch (Exception ex)
-                {
-                    skipped.Add($"{sourceParam.Definition.Name} (failed to add missing shared parameter: {ex.Message})");
-                    continue;
-                }
+                if (sourceParam.HasValue)
+                    unmatched.Add(sourceParam);
+                continue;
             }
 
             if (destinationParam.IsInstance)
@@ -413,186 +629,146 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         transaction.Commit();
 
-        var diagnostics = $"[ROTATIFY] Copied {copied} type parameter value(s) from source family ({added} newly added).";
+        var diagnostics = $"[ROTATIFY] Copied {copied} type parameter value(s) from source family.";
         if (skipped.Count > 0)
             diagnostics += $" [DBG] {skipped.Count} skipped: {string.Join("; ", skipped)}";
 
-        return (copied, skipped.Count, diagnostics);
+        return (copied, skipped.Count, diagnostics, unmatched);
     }
 
-    // Copies native form geometry (extrusions, blends, revolves, sweeps, swept blends) from the
-    // source family into the destination geometry family, replacing whatever forms already exist there.
-    // Forms are copied one at a time - `CopyElements` fails the whole batch if even one form can't be
-    // copied (e.g. a sketch anchored to a reference plane/face that doesn't exist in the destination),
-    // so batching would hide which forms actually work.
-    // Not every source family keeps its 3D geometry directly at the top level - some (e.g. MagiCAD
-    // exports) nest the REAL body one or more levels deep inside a "Generic Models" sub-family (often
-    // alongside a trivial/placeholder form at the top level too), mirroring how our own destination
-    // nests geometry inside 3D Orientation Family -> geometry family. `FindAllFormsSources` therefore
-    // collects forms from EVERY level rather than stopping at the first level that has any.
-    private static (int Copied, int Failed, string Diagnostics) CopyFormsFromSource(Document sourceDocument, Document destinationDocument, List<Document> nestedDocumentsToClose, Transform orientationCorrection)
+    // Second pass, run AFTER LoadFamily: sets values for source parameters that had no matching FAMILY
+    // parameter (pass 1's `Unmatched`). These are typically PROJECT parameters bound to the family's
+    // category (e.g. MagiCAD's "MC ..." params bound to Electrical Fixtures etc.) - Revit applies such
+    // bindings automatically to any type of a bound category once it's actually loaded into the
+    // project, so `loadedSymbol.LookupParameter(name)` only finds them at this point, not during
+    // family authoring.
+    private static (int Copied, string Diagnostics) ApplyProjectBoundParameters(Document activeDocument, FamilySymbol loadedSymbol, List<Parameter> unmatchedSourceParams)
     {
-        var sources = new List<(Document Document, Transform Transform)>();
-        FindAllFormsSources(sourceDocument, orientationCorrection, nestedDocumentsToClose, sources);
+        if (unmatchedSourceParams.Count == 0)
+            return (0, string.Empty);
 
-        var existingForms = new FilteredElementCollector(destinationDocument)
-            .OfClass(typeof(GenericForm))
-            .ToElementIds();
-
-        using var transaction = new Transaction(destinationDocument, "Copy forms from source family");
+        using var transaction = new Transaction(activeDocument, "Apply project-bound parameters to rotatified type");
         transaction.Start();
 
-        if (existingForms.Count > 0)
-            destinationDocument.Delete(existingForms);
+        if (!loadedSymbol.IsActive)
+            loadedSymbol.Activate();
 
         var copied = 0;
         var failures = new List<string>();
-        var nestedLevelsUsed = 0;
 
-        foreach (var (formsDocument, transform) in sources)
+        foreach (var sourceParam in unmatchedSourceParams)
         {
-            if (formsDocument != sourceDocument)
-                nestedLevelsUsed++;
-
-            // Voids are excluded: a void copied without its exact original cut-partner solid (e.g.
-            // because that solid failed to copy) produces invalid geometry that fails LoadFamily's
-            // audit outright, as opposed to a per-form copy failure which is merely reported and skipped.
-            var sourceForms = new FilteredElementCollector(formsDocument)
-                .OfClass(typeof(GenericForm))
-                .Cast<GenericForm>()
-                .Where(f => f.IsSolid)
-                .ToList();
-
-            foreach (var form in sourceForms)
+            var destinationParam = loadedSymbol.LookupParameter(sourceParam.Definition.Name);
+            if (destinationParam is null)
             {
-                try
+                failures.Add($"{sourceParam.Definition.Name} (no project-bound parameter found on the new type)");
+                continue;
+            }
+
+            if (destinationParam.IsReadOnly)
+            {
+                failures.Add($"{sourceParam.Definition.Name} (project-bound parameter is read-only)");
+                continue;
+            }
+
+            try
+            {
+                switch (sourceParam.StorageType)
                 {
-                    var copiedIds = ElementTransformUtils.CopyElements(formsDocument, new[] { form.Id }, destinationDocument, transform, new CopyPasteOptions());
-                    copied += copiedIds.Count;
+                    case StorageType.Double:
+                        destinationParam.Set(sourceParam.AsDouble());
+                        copied++;
+                        break;
+                    case StorageType.Integer:
+                        destinationParam.Set(sourceParam.AsInteger());
+                        copied++;
+                        break;
+                    case StorageType.String:
+                        var stringValue = sourceParam.AsString();
+                        if (stringValue is not null)
+                        {
+                            destinationParam.Set(stringValue);
+                            copied++;
+                        }
+                        else
+                        {
+                            failures.Add($"{sourceParam.Definition.Name} (source string value is null)");
+                        }
+                        break;
+                    default:
+                        failures.Add($"{sourceParam.Definition.Name} (storage type {sourceParam.StorageType} not handled)");
+                        break;
                 }
-                catch (Exception ex)
-                {
-                    failures.Add($"{form.GetType().Name} #{form.Id} ({ex.Message})");
-                }
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{sourceParam.Definition.Name} ({ex.Message})");
             }
         }
 
         transaction.Commit();
 
-        var diagnostics = nestedLevelsUsed > 0
-            ? $" [DBG] source geometry also found nested {nestedLevelsUsed} level(s) deep."
-            : string.Empty;
+        var diagnostics = $"[ROTATIFY] Applied {copied}/{unmatchedSourceParams.Count} project-bound parameter value(s) to the new type.";
         if (failures.Count > 0)
-            diagnostics += $" [DBG] {failures.Count} form(s) failed to copy: {string.Join("; ", failures)}";
+            diagnostics += $" [DBG] {failures.Count} failed: {string.Join("; ", failures)}";
 
-        return (copied, failures.Count, diagnostics);
+        return (copied, diagnostics);
     }
 
-    // Recursively collects EVERY document (the family itself, and any nested family instances) that
-    // holds GenericForm geometry, walked depth-first - does NOT stop at the first match, since some
-    // source families keep a trivial form at the top level alongside the real body nested deeper.
-    // Skips "Generic Annotations" instances since those are the 2D symbol, handled separately. Nested
-    // documents opened along the way are added to `openedDocuments` so the caller can close them.
-    private static void FindAllFormsSources(Document document, Transform cumulativeTransform, List<Document> openedDocuments, List<(Document Document, Transform Transform)> results, int depth = 0)
+    // Nests the ENTIRE source family as a single family instance inside the destination geometry
+    // family, instead of copying its individual GenericForm elements. This sidesteps every issue the
+    // per-form copy approach hit: labeled dimensions driving family parameters not present in the
+    // destination, `Blend` elements corrupting under rotation, and forms JOINED to each other blocking
+    // on rotate - none of that matters when the source family's internals are left completely
+    // untouched and simply placed as one nested instance. It also fixes the "2D symbol and 3D geometry
+    // face opposite directions" issue for free: both are part of the SAME source family, so whatever
+    // relationship they had originally is preserved automatically - nothing is rotated independently
+    // of anything else.
+    private static (int Copied, int Failed, string Diagnostics) NestSourceFamilyAsGeometry(Document sourceDocument, string sourceFamilyName, Document destinationDocument, XYZ orientationRotationAxis, double orientationRotationAngle)
     {
-        if (depth > 5)
-            return;
-
-        if (new FilteredElementCollector(document).OfClass(typeof(GenericForm)).GetElementCount() > 0)
-            results.Add((document, cumulativeTransform));
-
-        var nestedInstances = new FilteredElementCollector(document)
-            .OfClass(typeof(FamilyInstance))
-            .Cast<FamilyInstance>()
-            .Where(fi => (BuiltInCategory)(fi.Category?.Id.Value ?? -1) != BuiltInCategory.OST_GenericAnnotation)
+        var existingElements = new FilteredElementCollector(destinationDocument)
+            .WhereElementIsNotElementType()
+            .Where(e => e is GenericForm or FamilyInstance)
+            .Select(e => e.Id)
             .ToList();
 
-        foreach (var nested in nestedInstances)
+        using var transaction = new Transaction(destinationDocument, "Nest source family as geometry");
+        transaction.Start();
+
+        if (existingElements.Count > 0)
+            destinationDocument.Delete(existingElements);
+
+        var nestedFamily = destinationDocument.LoadFamily(sourceDocument, new FamilyLoadOptions());
+        if (nestedFamily is null)
         {
-            Document nestedDocument;
-            try
-            {
-                nestedDocument = document.EditFamily(nested.Symbol.Family);
-            }
-            catch
-            {
-                continue;
-            }
-
-            openedDocuments.Add(nestedDocument);
-            FindAllFormsSources(nestedDocument, cumulativeTransform.Multiply(nested.GetTransform()), openedDocuments, results, depth + 1);
-        }
-    }
-
-    // Auto-detects whether the source family's real 3D geometry needs a 90 deg correction to match
-    // the rotatable template's default convention (thinnest extent along local Z). Computed from the
-    // ACTUAL combined bounding box of the source's solids (across every nested level), not guessed:
-    // if the thinnest extent is instead along Y (the common wall-hosted convention: X=width along wall,
-    // Y=depth into wall, Z=vertical), rotating 90 deg about X swaps Y and Z to match the template.
-    private static Transform DetermineOrientationCorrection(Document sourceDocument, out string diagnostics)
-    {
-        var scratchOpenedDocuments = new List<Document>();
-        var sources = new List<(Document Document, Transform Transform)>();
-        FindAllFormsSources(sourceDocument, Transform.Identity, scratchOpenedDocuments, sources);
-
-        XYZ? min = null;
-        XYZ? max = null;
-
-        foreach (var (formsDocument, transform) in sources)
-        {
-            var forms = new FilteredElementCollector(formsDocument)
-                .OfClass(typeof(GenericForm))
-                .Cast<GenericForm>()
-                .Where(f => f.IsSolid);
-
-            foreach (var form in forms)
-            {
-                var bbox = form.get_BoundingBox(null);
-                if (bbox is null)
-                    continue;
-
-                foreach (var localCorner in EnumerateBoundingBoxCorners(bbox))
-                {
-                    var corner = transform.OfPoint(localCorner);
-                    min = min is null ? corner : new XYZ(Math.Min(min.X, corner.X), Math.Min(min.Y, corner.Y), Math.Min(min.Z, corner.Z));
-                    max = max is null ? corner : new XYZ(Math.Max(max.X, corner.X), Math.Max(max.Y, corner.Y), Math.Max(max.Z, corner.Z));
-                }
-            }
+            transaction.RollBack();
+            return (0, 1, $"[DBG] Failed to load '{sourceFamilyName}' as a nested family.");
         }
 
-        foreach (var scratchDocument in scratchOpenedDocuments)
-            scratchDocument.Close(false);
+        // Newly loaded family types aren't visible via GetFamilySymbolIds() until the document is
+        // regenerated - without this, the lookup below finds nothing even though the load succeeded.
+        destinationDocument.Regenerate();
 
-        if (min is null || max is null)
+        var nestedSymbol = nestedFamily.GetFamilySymbolIds()
+            .Select(destinationDocument.GetElement)
+            .OfType<FamilySymbol>()
+            .FirstOrDefault();
+
+        if (nestedSymbol is null)
         {
-            diagnostics = string.Empty;
-            return Transform.Identity;
+            transaction.RollBack();
+            return (0, 1, $"[DBG] Loaded '{sourceFamilyName}' but could not find a family type to place.");
         }
 
-        var extentX = max.X - min.X;
-        var extentY = max.Y - min.Y;
-        var extentZ = max.Z - min.Z;
+        if (!nestedSymbol.IsActive)
+            nestedSymbol.Activate();
 
-        if (extentY <= extentX && extentY <= extentZ)
-        {
-            diagnostics = $" [DBG] source geometry looks wall-mounted (thinnest along Y: X={extentX:F2} Y={extentY:F2} Z={extentZ:F2}); rotated 90 deg to match the template's default orientation.";
-            return Transform.CreateRotation(XYZ.BasisX, Math.PI / 2);
-        }
+        var instance = destinationDocument.FamilyCreate.NewFamilyInstance(XYZ.Zero, nestedSymbol, StructuralType.NonStructural);
+        ElementTransformUtils.RotateElement(destinationDocument, instance.Id, Line.CreateUnbound(XYZ.Zero, orientationRotationAxis), orientationRotationAngle);
 
-        diagnostics = $" [DBG] source geometry orientation matches the template default (X={extentX:F2} Y={extentY:F2} Z={extentZ:F2}); no rotation applied.";
-        return Transform.Identity;
-    }
+        transaction.Commit();
 
-    private static IEnumerable<XYZ> EnumerateBoundingBoxCorners(BoundingBoxXYZ bbox)
-    {
-        yield return new XYZ(bbox.Min.X, bbox.Min.Y, bbox.Min.Z);
-        yield return new XYZ(bbox.Max.X, bbox.Min.Y, bbox.Min.Z);
-        yield return new XYZ(bbox.Min.X, bbox.Max.Y, bbox.Min.Z);
-        yield return new XYZ(bbox.Min.X, bbox.Min.Y, bbox.Max.Z);
-        yield return new XYZ(bbox.Max.X, bbox.Max.Y, bbox.Min.Z);
-        yield return new XYZ(bbox.Max.X, bbox.Min.Y, bbox.Max.Z);
-        yield return new XYZ(bbox.Min.X, bbox.Max.Y, bbox.Max.Z);
-        yield return new XYZ(bbox.Max.X, bbox.Max.Y, bbox.Max.Z);
+        return (1, 0, string.Empty);
     }
 
     private static IExtensionResult CreateNewFamily(Document activeDocument, FlexiRfaArgs args)
@@ -653,6 +829,47 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             .OfClass(typeof(Family))
             .Cast<Family>()
             .Any(f => f.Name.Equals(familyName, StringComparison.OrdinalIgnoreCase));
+
+    // Aborts entirely (returns a non-null message) if the source family or any of its placed instances
+    // are owned by another user - checked BEFORE any work starts, so a Rotatify run never gets partway
+    // through only to discover it can't swap/delete elements someone else is actively editing. Not
+    // applicable to non-workshared (standalone) documents, which have no ownership concept at all.
+    private static string? CheckOwnership(Document activeDocument, Family sourceFamily)
+    {
+        if (!activeDocument.IsWorkshared)
+            return null;
+
+        var elementsToCheck = new FilteredElementCollector(activeDocument)
+            .OfClass(typeof(FamilyInstance))
+            .WhereElementIsNotElementType()
+            .Cast<FamilyInstance>()
+            .Where(instance => instance.Symbol.Family.Id == sourceFamily.Id)
+            .Select(instance => (Id: instance.Id, Description: $"instance #{instance.Id}"))
+            .Append((Id: sourceFamily.Id, Description: $"source family '{sourceFamily.Name}'"))
+            .ToList();
+
+        var blockers = new List<string>();
+
+        foreach (var (id, description) in elementsToCheck)
+        {
+            var status = WorksharingUtils.GetCheckoutStatus(activeDocument, id, out var owner);
+            if (status == CheckoutStatus.OwnedByOtherUser)
+                blockers.Add($"{description} (owned by '{owner}')");
+        }
+
+        if (blockers.Count == 0)
+            return null;
+
+        return $"Rotatify mode aborted: {blockers.Count} element(s) are owned by another user and must be released before running this: {string.Join("; ", blockers)}";
+    }
+
+    // The rotatable template's nested "3D Orientation Family" instance is a reliable structural
+    // fingerprint - any family built from this template has one, non-rotatable source families don't.
+    private static bool IsAlreadyRotatable(Document sourceDocument) =>
+        new FilteredElementCollector(sourceDocument)
+            .OfClass(typeof(FamilyInstance))
+            .Cast<FamilyInstance>()
+            .Any(instance => instance.Symbol.Family.Name.Equals("3D Orientation Family", StringComparison.OrdinalIgnoreCase));
 
     private static void SetFamilyCategory(Document familyDocument, FlexiRfaArgs args) =>
         SetFamilyCategoryByName(familyDocument, args.FamilyCategory);
