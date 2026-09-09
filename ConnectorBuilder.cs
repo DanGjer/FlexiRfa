@@ -134,7 +134,8 @@ internal static class ConnectorBuilder
         return specs;
     }
 
-    private static Solid? GetLargestSolid(Document familyDocument)
+    // internal (not private): reused by the Test-mode connector-transplant experiment.
+    internal static Solid? GetLargestSolid(Document familyDocument)
     {
         var options = new Options { ComputeReferences = true };
 
@@ -160,12 +161,17 @@ internal static class ConnectorBuilder
             _ => XYZ.BasisY.Negate(),
         };
 
-        return extrusion.Faces
-            .OfType<PlanarFace>()
-            .Where(f => f.Reference is not null && f.FaceNormal.DotProduct(normal) > 0.9)
-            .OrderByDescending(f => f.Origin.DotProduct(normal))
-            .FirstOrDefault();
+        return GetClosestFace(extrusion, normal);
     }
+
+    // Picks the outermost planar face whose normal most closely matches an arbitrary direction -
+    // used to re-host a copied connector on whichever face corresponds to its source-family direction.
+    internal static PlanarFace? GetClosestFace(Solid solid, XYZ direction) =>
+        solid.Faces
+            .OfType<PlanarFace>()
+            .Where(f => f.Reference is not null && f.FaceNormal.DotProduct(direction) > 0.9)
+            .OrderByDescending(f => f.Origin.DotProduct(direction))
+            .FirstOrDefault();
 
     private static IEnumerable<Solid> EnumerateSolids(GeometryElement geometry)
     {
