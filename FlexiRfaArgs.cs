@@ -23,7 +23,10 @@ public class FlexiRfaArgs
     [Required(ErrorMessage = "New family name is required.")]
     public string NewFamilyName { get; set; } = string.Empty;
 
-    [OptionsField(Label = "Family category", ToolTip = "Revit category the generated family is assigned to", CollectorType = typeof(ElectricalCategoryCollector), CollectorSortOrder = SortOrder.SortByAscending, Visibility = CreateNewVisibility)]
+    [BooleanField(Label = "Bypass failsafes", ToolTip = "Continue Rotatify even when individual geometry elements fail to copy", Visibility = $"{nameof(Mode)} == 'Rotatify'")]
+    public bool BypassFailsafes { get; set; }
+
+    [OptionsField(Label = "Family category", ToolTip = "Revit category the generated family is assigned to", CollectorType = typeof(ElectricalCategoryCollector), CollectorSortOrder = SortOrder.SortByAscending, Visibility = $"{nameof(Mode)} == 'CreateNew'")]
     public string? FamilyCategory { get; set; }
 
     [OptionsField(Label = "Preset", ToolTip = "Preset dimensions for common fixture types", Visibility = CreateNewVisibility)]

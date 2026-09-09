@@ -50,6 +50,9 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         var sourceTypeName = selectedInstance.Symbol.Name;
         var newFamilyName = $"{sourceFamilyName} Replacement";
 
+        if (selectedInstance.HostFace is not null)
+            return Result.Text.Failed($"'{sourceFamilyName}' is not rotatable: face-based RFAs are not supported.");
+
         if (FamilyNameExists(activeDocument, newFamilyName))
             return Result.Text.Failed($"A family named '{newFamilyName}' already exists in this document.");
 
@@ -67,7 +70,11 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
 
         Document? familyDocument = null;
         Document? sourceDocument = null;
-        var copyResult = default((int Copied, int Failed, string Diagnostics));
+        var nestedSourceDocuments = new List<Document>();
+        var copyResult = default((int Copied, int Failed, int Total, string Diagnostics));
+        TransactionGroup? projectTransactionGroup = null;
+        var projectTransactionGroupStarted = false;
+        var projectTransactionGroupCommitted = false;
 
         try
         {
@@ -115,7 +122,7 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             var typeParamResult = CopyTypeParametersFromSource(selectedInstance.Symbol, familyDocument);
 
             var error = ReplaceOrientationGeometry(familyDocument, args, out var geometryHost, out var transformInfo,
-                geometryDocument => copyResult = NestSourceFamilyAsGeometry(sourceDocument, sourceFamilyName, geometryDocument, orientationAxis, orientationAngle));
+                geometryDocument => copyResult = CopyFormsFromSource(sourceDocument, geometryDocument, nestedSourceDocuments, orientationAxis, orientationAngle));
             if (error is not null)
                 return Result.Text.Failed(error);
 
@@ -123,7 +130,10 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             // otherwise the steps below would happily load an empty family and swap real instances onto
             // it, which is far worse than just failing here.
             if (copyResult.Copied == 0)
-                return Result.Text.Failed($"Failed to nest '{sourceFamilyName}' as geometry - no instances were touched.{copyResult.Diagnostics}");
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: no geometry could be copied. No project changes were made.{copyResult.Diagnostics}");
+
+            if (copyResult.Failed > 0 && !args.BypassFailsafes)
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: {copyResult.Failed} geometry element(s) failed to copy. No project changes were made.{copyResult.Diagnostics}");
 
             try
             {
@@ -146,12 +156,27 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
             // the TOP-LEVEL source family (not inside the 3D geometry), so it's copied the same way.
             var symbolResult = CopyGenericAnnotationsFromSource(sourceDocument, familyDocument);
 
+            if (connectorResult.Failed > 0 || symbolResult.Failed > 0)
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: a required connector or 2D symbol could not be copied. No project changes were made.{connectorResult.Diagnostics} {symbolResult.Diagnostics}");
+
             familyDocument.LoadFamily(activeDocument, new FamilyLoadOptions());
 
             var loadedFamily = new FilteredElementCollector(activeDocument)
                 .OfClass(typeof(Family))
                 .Cast<Family>()
                 .FirstOrDefault(f => f.Name.Equals(newFamilyName, StringComparison.OrdinalIgnoreCase));
+
+            if (loadedFamily is null)
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: the loaded replacement family could not be found. No project changes were made.");
+
+            if (sourceFamily.FamilyPlacementType != loadedFamily.FamilyPlacementType)
+            {
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: the source family uses '{sourceFamily.FamilyPlacementType}' placement, but the rotatable template uses '{loadedFamily.FamilyPlacementType}'. Revit cannot replace these hosted instances safely.");
+            }
+
+            projectTransactionGroup = new TransactionGroup(activeDocument, "Rotatify replacement");
+            projectTransactionGroup.Start();
+            projectTransactionGroupStarted = true;
 
             // Parameters not embedded in the family itself (e.g. MagiCAD's "MC ..." params) are often
             // PROJECT parameters bound to categories like Electrical Fixtures - they only become available
@@ -165,30 +190,58 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
                 ? ApplyProjectBoundParameters(activeDocument, loadedSymbol, typeParamResult.Unmatched)
                 : (Copied: 0, Diagnostics: string.Empty);
 
-            var replaceResult = loadedFamily is null
-                ? (Replaced: 0, Failed: 0, Diagnostics: $"[DBG] Could not find loaded family '{newFamilyName}' in the active document to replace instances with.")
-                : ReplaceInstancesOfSourceFamily(activeDocument, sourceFamily, loadedFamily, sourceTypeName);
+            var replaceResult = ReplaceInstancesOfSourceFamily(activeDocument, sourceFamily, loadedFamily!, sourceTypeName);
+
+            if (replaceResult.Failed > 0 || replaceResult.Replaced == 0)
+            {
+                projectTransactionGroup.RollBack();
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: {replaceResult.Failed} instance(s) could not be replaced. All project changes were rolled back.{replaceResult.Diagnostics}");
+            }
 
             // Only delete the source family once every instance has actually been moved off it - a
             // partial replace (some instances failed the swap) must NOT delete the family they still use.
             // Once deleted, the "Replacement" suffix no longer makes sense - the new family takes over
             // the source's original name entirely.
-            var deleteSourceResult = loadedFamily is null
-                ? (Deleted: false, Diagnostics: string.Empty)
-                : DeleteSourceFamilyIfUnused(activeDocument, sourceFamily, loadedFamily);
+            var deleteSourceResult = DeleteSourceFamilyIfUnused(activeDocument, sourceFamily, loadedFamily!);
 
-            var message = $"[ROTATIFY] Nested '{sourceFamilyName}' as geometry into '{geometryHost}' of '{newFamilyName}' (type '{sourceTypeName}') and loaded it into the active document. {transformInfo}{copyResult.Diagnostics} {connectorResult.Diagnostics} {symbolResult.Diagnostics} {typeParamResult.Diagnostics} {projectBindingResult.Diagnostics} {replaceResult.Diagnostics} {deleteSourceResult.Diagnostics}";
+            if (!deleteSourceResult.Deleted)
+            {
+                projectTransactionGroup.RollBack();
+                return Result.Text.Failed($"'{sourceFamilyName}' is unrotatable: the source family could not be safely deleted after replacement. All project changes were rolled back. SourceId={sourceFamily.Id.Value}, ReplacementId={loadedFamily!.Id.Value}. {replaceResult.Diagnostics} {deleteSourceResult.Diagnostics}");
+            }
+
+            projectTransactionGroup.Assimilate();
+            projectTransactionGroupCommitted = true;
+
+            var geometryStatus = copyResult.Failed == 0
+                ? $"All geometry copied ({copyResult.Copied}/{copyResult.Total})"
+                : $"Geometry copied partially ({copyResult.Copied}/{copyResult.Total}; {copyResult.Failed} failed)";
+            var connectorStatus = connectorResult.Failed == 0
+                ? $"All connectors copied ({connectorResult.Copied})"
+                : $"Connectors copied partially ({connectorResult.Copied}; {connectorResult.Failed} failed)";
+            var symbolStatus = symbolResult.Failed == 0
+                ? $"All 2D symbols copied ({symbolResult.Copied})"
+                : $"2D symbols copied partially ({symbolResult.Copied}; {symbolResult.Failed} failed)";
+            var chanceNote = args.BypassFailsafes && copyResult.Failed > 0
+                ? " Continued despite geometry failures because 'Bypass failsafes' was selected."
+                : string.Empty;
+            var message = $"[ROTATIFY] Completed '{sourceFamilyName}'. {geometryStatus}. {connectorStatus}. {symbolStatus}. Type parameters copied: {typeParamResult.Copied}. Project parameters applied: {projectBindingResult.Copied}. Instances replaced: {replaceResult.Replaced}. Source family deleted and renamed successfully.{chanceNote}";
             return copyResult.Failed > 0 && copyResult.Copied == 0
                 ? Result.Text.Failed(message)
                 : Result.Text.Succeeded(message);
         }
         catch (Exception ex)
         {
+            if (projectTransactionGroupStarted && projectTransactionGroup is not null && !projectTransactionGroupCommitted)
+                projectTransactionGroup.RollBack();
             var innerMessage = ex.InnerException is not null ? $" | Inner: {ex.InnerException.Message}" : string.Empty;
             return Result.Text.Failed($"Rotatify mode failed: {ex.Message}{innerMessage} [DBG] Nested source geometry: {copyResult.Copied} before failure.{copyResult.Diagnostics} {ex.GetType().Name} at: {ex.StackTrace}");
         }
         finally
         {
+            projectTransactionGroup?.Dispose();
+            foreach (var nestedDocument in nestedSourceDocuments)
+                nestedDocument.Close(false);
             sourceDocument?.Close(false);
             familyDocument?.Close(false);
             TryDeleteDirectory(workingDirectory);
@@ -715,60 +768,118 @@ public class FlexiRfaCommand : IRevitExtension<FlexiRfaArgs>
         return (copied, diagnostics);
     }
 
-    // Nests the ENTIRE source family as a single family instance inside the destination geometry
-    // family, instead of copying its individual GenericForm elements. This sidesteps every issue the
-    // per-form copy approach hit: labeled dimensions driving family parameters not present in the
-    // destination, `Blend` elements corrupting under rotation, and forms JOINED to each other blocking
-    // on rotate - none of that matters when the source family's internals are left completely
-    // untouched and simply placed as one nested instance. It also fixes the "2D symbol and 3D geometry
-    // face opposite directions" issue for free: both are part of the SAME source family, so whatever
-    // relationship they had originally is preserved automatically - nothing is rotated independently
-    // of anything else.
-    private static (int Copied, int Failed, string Diagnostics) NestSourceFamilyAsGeometry(Document sourceDocument, string sourceFamilyName, Document destinationDocument, XYZ orientationRotationAxis, double orientationRotationAngle)
+    private static (int Copied, int Failed, int Total, string Diagnostics) CopyFormsFromSource(Document sourceDocument, Document destinationDocument, List<Document> nestedDocumentsToClose, XYZ orientationRotationAxis, double orientationRotationAngle)
     {
-        var existingElements = new FilteredElementCollector(destinationDocument)
-            .WhereElementIsNotElementType()
-            .Where(e => e is GenericForm or FamilyInstance)
-            .Select(e => e.Id)
-            .ToList();
+        var sources = new List<(Document Document, Transform Transform)>();
+        FindAllFormsSources(sourceDocument, Transform.Identity, nestedDocumentsToClose, sources);
 
-        using var transaction = new Transaction(destinationDocument, "Nest source family as geometry");
+        var existingForms = new FilteredElementCollector(destinationDocument)
+            .OfClass(typeof(GenericForm))
+            .ToElementIds();
+
+        using var transaction = new Transaction(destinationDocument, "Copy forms from source family");
         transaction.Start();
+        if (existingForms.Count > 0)
+            destinationDocument.Delete(existingForms);
 
-        if (existingElements.Count > 0)
-            destinationDocument.Delete(existingElements);
+        var copied = 0;
+        var failures = new List<string>();
+        var nestedLevelsUsed = 0;
+        var blendsFixedUpViaMirror = 0;
+        var totalByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var copiedByType = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var rotation = Transform.CreateRotation(orientationRotationAxis, orientationRotationAngle);
+        var isHalfTurn = Math.Abs(Math.Abs(orientationRotationAngle) - Math.PI) < 1e-9;
+        var mirrorNormalA = isHalfTurn
+            ? (orientationRotationAxis.CrossProduct(XYZ.BasisX).IsZeroLength()
+                ? orientationRotationAxis.CrossProduct(XYZ.BasisY)
+                : orientationRotationAxis.CrossProduct(XYZ.BasisX)).Normalize()
+            : XYZ.Zero;
+        var mirrorNormalB = isHalfTurn ? orientationRotationAxis.CrossProduct(mirrorNormalA).Normalize() : XYZ.Zero;
 
-        var nestedFamily = destinationDocument.LoadFamily(sourceDocument, new FamilyLoadOptions());
-        if (nestedFamily is null)
+        foreach (var (formsDocument, transform) in sources)
         {
-            transaction.RollBack();
-            return (0, 1, $"[DBG] Failed to load '{sourceFamilyName}' as a nested family.");
+            if (formsDocument != sourceDocument)
+                nestedLevelsUsed++;
+
+            var sourceForms = new FilteredElementCollector(formsDocument)
+                .OfClass(typeof(GenericForm))
+                .Cast<GenericForm>()
+                .Where(f => f.IsSolid)
+                .ToList();
+
+            foreach (var form in sourceForms)
+            {
+                var formType = form.GetType().Name;
+                totalByType[formType] = totalByType.GetValueOrDefault(formType) + 1;
+                try
+                {
+                    var copiedIds = ElementTransformUtils.CopyElements(
+                        formsDocument,
+                        new[] { form.Id },
+                        destinationDocument,
+                        form is Blend && isHalfTurn ? transform : rotation.Multiply(transform),
+                        new CopyPasteOptions());
+                    copied += copiedIds.Count;
+                    copiedByType[formType] = copiedByType.GetValueOrDefault(formType) + copiedIds.Count;
+
+                    if (form is Blend && isHalfTurn)
+                    {
+                        var idList = copiedIds.ToList();
+                        ElementTransformUtils.MirrorElements(destinationDocument, idList, Plane.CreateByNormalAndOrigin(mirrorNormalA, XYZ.Zero), false);
+                        ElementTransformUtils.MirrorElements(destinationDocument, idList, Plane.CreateByNormalAndOrigin(mirrorNormalB, XYZ.Zero), false);
+                        blendsFixedUpViaMirror += copiedIds.Count;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"{form.GetType().Name} #{form.Id} ({ex.Message})");
+                }
+            }
         }
-
-        // Newly loaded family types aren't visible via GetFamilySymbolIds() until the document is
-        // regenerated - without this, the lookup below finds nothing even though the load succeeded.
-        destinationDocument.Regenerate();
-
-        var nestedSymbol = nestedFamily.GetFamilySymbolIds()
-            .Select(destinationDocument.GetElement)
-            .OfType<FamilySymbol>()
-            .FirstOrDefault();
-
-        if (nestedSymbol is null)
-        {
-            transaction.RollBack();
-            return (0, 1, $"[DBG] Loaded '{sourceFamilyName}' but could not find a family type to place.");
-        }
-
-        if (!nestedSymbol.IsActive)
-            nestedSymbol.Activate();
-
-        var instance = destinationDocument.FamilyCreate.NewFamilyInstance(XYZ.Zero, nestedSymbol, StructuralType.NonStructural);
-        ElementTransformUtils.RotateElement(destinationDocument, instance.Id, Line.CreateUnbound(XYZ.Zero, orientationRotationAxis), orientationRotationAngle);
 
         transaction.Commit();
 
-        return (1, 0, string.Empty);
+        var geometrySummary = string.Join(", ", totalByType
+            .OrderBy(pair => pair.Key)
+            .Select(pair => $"{pair.Key} {copiedByType.GetValueOrDefault(pair.Key)}/{pair.Value}"));
+        var diagnostics = $" [ROTATIFY] Geometry copied: {copied}/{totalByType.Values.Sum()} form(s) ({geometrySummary}).";
+        if (nestedLevelsUsed > 0)
+            diagnostics += $" [DBG] source geometry also found nested {nestedLevelsUsed} level(s) deep.";
+        if (blendsFixedUpViaMirror > 0)
+            diagnostics += $" [DBG] rotated {blendsFixedUpViaMirror} Blend form(s) via mirror workaround.";
+        if (failures.Count > 0)
+            diagnostics += $" [DBG] {failures.Count} form(s) failed to copy: {string.Join("; ", failures)}";
+
+        return (copied, failures.Count, totalByType.Values.Sum(), diagnostics);
+    }
+
+    private static void FindAllFormsSources(Document document, Transform cumulativeTransform, List<Document> openedDocuments, List<(Document Document, Transform Transform)> results, int depth = 0)
+    {
+        if (depth > 5)
+            return;
+
+        if (new FilteredElementCollector(document).OfClass(typeof(GenericForm)).GetElementCount() > 0)
+            results.Add((document, cumulativeTransform));
+
+        var nestedInstances = new FilteredElementCollector(document)
+            .OfClass(typeof(FamilyInstance))
+            .Cast<FamilyInstance>()
+            .Where(fi => (BuiltInCategory)(fi.Category?.Id.Value ?? -1) != BuiltInCategory.OST_GenericAnnotation)
+            .ToList();
+
+        foreach (var nested in nestedInstances)
+        {
+            try
+            {
+                var nestedDocument = document.EditFamily(nested.Symbol.Family);
+                openedDocuments.Add(nestedDocument);
+                FindAllFormsSources(nestedDocument, cumulativeTransform.Multiply(nested.GetTransform()), openedDocuments, results, depth + 1);
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static IExtensionResult CreateNewFamily(Document activeDocument, FlexiRfaArgs args)
